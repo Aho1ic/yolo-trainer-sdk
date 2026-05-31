@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 YOLO模型推理预测类
-支持目标检测和实例分割
+支持目标检测、实例分割和关键点检测
 """
 
 import os
@@ -13,16 +13,9 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 
-# 尝试导入MinIO客户端
-try:
-    from .minio_client import get_minio_manager
-    MINIO_AVAILABLE = True
-except ImportError:
-    MINIO_AVAILABLE = False
-
 
 class Predict:
-    """YOLO模型推理类，支持目标检测和实例分割"""
+    """YOLO模型推理类，支持目标检测、实例分割和关键点检测"""
     
     def __init__(
         self,
@@ -40,7 +33,7 @@ class Predict:
         Args:
             dataset_address: 待预测图片的文件夹路径
             model_address: YOLO模型路径
-            duty_type: 任务类型，"detect"表示目标检测，"segment"表示实例分割
+            duty_type: 任务类型，"detect"表示目标检测，"segment"表示实例分割，"pose"表示关键点检测
             img_size: 输入图像尺寸，对应YOLO的imgsz参数
             conf_threshold: 置信度阈值
             iou_threshold: IOU阈值
@@ -68,7 +61,7 @@ class Predict:
     
     def _setup_logger(self) -> logging.Logger:
         """设置日志记录器"""
-        logger = logging.getLogger(f"Predict_{id(self)}")
+        logger = logging.getLogger(f"utils.predict.{Path(self.model_address).stem}")
         logger.setLevel(logging.INFO)
         
         # 添加控制台处理器
@@ -96,8 +89,8 @@ class Predict:
             raise ValueError(f"模型文件不存在: {self.model_address}")
         
         # 验证任务类型
-        if self.duty_type not in ["detect", "segment"]:
-            raise ValueError(f"不支持的任务类型: {self.duty_type}，仅支持'detect'或'segment'")
+        if self.duty_type not in ["detect", "segment", "pose"]:
+            raise ValueError(f"不支持的任务类型: {self.duty_type}，仅支持'detect'、'segment'或'pose'")
         
         # 验证图像尺寸
         if self.img_size <= 0 or self.img_size % 32 != 0:
@@ -205,7 +198,7 @@ class Predict:
             
             self.logger.info(f"推理完成！结果保存在: {self.predicted_result_address}")
             
-            # MinIO上传由调用方（train_api.py）处理
+            # 结果文件复制由调用方（train_api.py）处理
             
             # 返回结果
             result = {
@@ -256,8 +249,8 @@ def main():
     parser.add_argument('--model_address', type=str, required=True,
                         help='YOLO模型路径')
     parser.add_argument('--duty_type', type=str, default='detect',
-                        choices=['detect', 'segment'],
-                        help='任务类型：detect(目标检测) 或 segment(实例分割)')
+                        choices=['detect', 'segment', 'pose'],
+                        help='任务类型：detect(目标检测) / segment(实例分割) / pose(关键点检测)')
     parser.add_argument('--img_size', type=int, default=640,
                         help='输入图像尺寸（对应YOLO的imgsz参数）')
     parser.add_argument('--conf_threshold', type=float, default=0.25,

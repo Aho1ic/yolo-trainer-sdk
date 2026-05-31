@@ -16,7 +16,6 @@ import logging
 import os
 import sys
 import subprocess
-import signal
 import json
 import shutil
 import random
@@ -30,6 +29,8 @@ import glob
 import csv
 import hashlib
 import traceback
+import urllib.error
+import urllib.request
 from collections import Counter
 import torch
 from ultralytics import YOLO
@@ -37,15 +38,19 @@ from config import TrainerConfig
 from utils.json2txt import UnifiedJsonConverter
 from utils.create_dataset_yaml import parse_labels
 from utils import DatasetDetailAnalyzer
-from utils.path_handler import PathHandler, ensure_local_path
-from utils.minio_client import get_minio_manager
+from utils.path_handler import LEGACY_STORAGE_PREFIXES, PathHandler, ensure_local_path
+from utils.dataset_hash import ORIGINAL_DATASET_HASH_SCHEMA_VERSION, compute_original_dataset_hash
+from utils.annotation_paths import resolve_annotation_dir
+from utils.pose_labels import assign_points_to_rectangles, infer_shape_type as infer_pose_shape_type, sort_keypoint_labels
 from utils.predict import Predict
+from utils.snowflake import SnowflakeIDGenerator
 
 # 导入新模块
 from services.exceptions import BusinessError, ValidationError, NotFoundError
 from api.validators import (
     validate_dataset_id as _validate_dataset_id,
     validate_task_id as _validate_task_id,
+    validate_positive_id as _validate_positive_id,
     validate_status as _validate_status,
     sanitize_string as _sanitize_string,
     sanitize_filename as _sanitize_filename,
@@ -64,63 +69,7 @@ except ImportError:
 from database.manager import DatabaseManager as BaseDatabaseManager
 
 
-class SnowflakeIdGenerator:
-    def __init__(self, worker_id=1, datacenter_id=1):
-        self.worker_id = worker_id
-        self.datacenter_id = datacenter_id
-        self.sequence = 0
-        self.last_timestamp = -1
-        
-        self.worker_id_bits = 5
-        self.datacenter_id_bits = 5
-        self.sequence_bits = 12
-        
-        self.max_worker_id = -1 ^ (-1 << self.worker_id_bits)
-        self.max_datacenter_id = -1 ^ (-1 << self.datacenter_id_bits)
-        self.max_sequence = -1 ^ (-1 << self.sequence_bits)
-        
-        self.worker_id_shift = self.sequence_bits
-        self.datacenter_id_shift = self.sequence_bits + self.worker_id_bits
-        self.timestamp_shift = self.sequence_bits + self.worker_id_bits + self.datacenter_id_bits
-        
-        self.epoch = 1577836800000
-        
-        self._lock = threading.Lock()
-    
-    def _current_millis(self):
-        return int(time.time() * 1000)
-    
-    def _wait_next_millis(self, last_timestamp):
-        timestamp = self._current_millis()
-        while timestamp <= last_timestamp:
-            timestamp = self._current_millis()
-        return timestamp
-    
-    def generate_id(self):
-        with self._lock:
-            timestamp = self._current_millis()
-            
-            if timestamp < self.last_timestamp:
-                raise Exception("时钟回拨，拒绝生成ID")
-            
-            if timestamp == self.last_timestamp:
-                self.sequence = (self.sequence + 1) & self.max_sequence
-                if self.sequence == 0:
-                    timestamp = self._wait_next_millis(self.last_timestamp)
-            else:
-                self.sequence = 0
-            
-            self.last_timestamp = timestamp
-            
-            snowflake_id = ((timestamp - self.epoch) << self.timestamp_shift) | \
-                          (self.datacenter_id << self.datacenter_id_shift) | \
-                          (self.worker_id << self.worker_id_shift) | \
-                          self.sequence
-            
-            return snowflake_id
-
-
-snowflake_generator = SnowflakeIdGenerator(worker_id=1, datacenter_id=1)
+snowflake_generator = SnowflakeIDGenerator(datacenter_id=1, machine_id=1)
 
 # 配置日志（使用统一的日志模块）
 from utils.logger import setup_logger
@@ -168,6 +117,11 @@ def validate_task_id(task_id) -> int:
     return _validate_task_id(task_id)
 
 
+def validate_positive_id(value, field_name: str = "id") -> int:
+    """验证并转换业务 ID 为正整数，防止路径遍历攻击"""
+    return _validate_positive_id(value, field_name)
+
+
 def sanitize_string(value: str, max_length: int = 255) -> str:
     """清理字符串输入，移除潜在危险字符"""
     return _sanitize_string(value, max_length)
@@ -198,7 +152,7 @@ def handle_api_exception(e: Exception, context: str = "") -> tuple:
         return jsonify(e.to_dict()), e.status_code
 
     # 系统异常：记录详细信息，返回通用错误消息
-    error_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+    error_id = hashlib.md5(str(time.time()).encode(), usedforsecurity=False).hexdigest()[:8]
     logger.error(f"[系统异常] {context} (error_id={error_id}): {str(e)}")
     logger.error(traceback.format_exc())
 
@@ -211,32 +165,13 @@ def handle_api_exception(e: Exception, context: str = "") -> tuple:
     }), 500
 
 
-ANNOTATION_DIR_NAMES = ('json', 'jsons')
 DATASET_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
-
-
-def resolve_annotation_dir(base_dir):
-    """返回本地已存在的标注目录，兼容 json/jsons"""
-    base_dir = Path(base_dir)
-    for dir_name in ANNOTATION_DIR_NAMES:
-        candidate = base_dir / dir_name
-        if candidate.exists():
-            return candidate
-    return base_dir / ANNOTATION_DIR_NAMES[0]
+DATASET_VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm', '.mpg', '.mpeg', '.m4v'}
 
 
 def prepare_split_dirs_for_original_analysis(original_data_address):
-    """
-    为原始数据集统计准备 train/valid 目录。
-
-    MinIO/RustFS 路径先通过 S3 API 落到本地工作区，不能直接读后端目录。
-    """
-    if PathHandler.is_minio_path(original_data_address):
-        local_original_dir = Path(materialize_minio_dataset_dir(original_data_address, '原始数据'))
-        local_parent_dir = local_original_dir.parent
-        return local_parent_dir / 'train', local_parent_dir / 'valid', local_original_dir
-
-    local_original_dir = Path(original_data_address)
+    """为原始数据集统计准备 train/valid 目录"""
+    local_original_dir = Path(ensure_local_path(original_data_address))
     local_parent_dir = local_original_dir.parent
     return local_parent_dir / 'train', local_parent_dir / 'valid', local_original_dir
 
@@ -246,6 +181,9 @@ def merge_draw_types(draw_types):
     normalized_types = {draw_type for draw_type in draw_types if draw_type}
     if not normalized_types:
         return 'rectangle'
+    # pose 数据集（rectangle + point）整体视为 point 类型，与训练侧一致
+    if 'point' in normalized_types:
+        return 'point'
     if 'mix' in normalized_types or len(normalized_types) > 1:
         return 'mix'
     return next(iter(normalized_types))
@@ -335,13 +273,13 @@ def analyze_original_dataset_from_splits(original_data_address):
     return aggregate_original_analysis_results(train_result, valid_result, analysis_output_dir)
 
 
-def materialize_minio_dataset_dir(minio_path, split_name):
+def materialize_dataset_dir(storage_path, split_name):
     """兼容旧调用：下载 images/json 到本地工作区"""
-    if not PathHandler.is_minio_path(minio_path):
-        return minio_path
+    if not PathHandler.is_legacy_remote_uri(storage_path):
+        return storage_path
 
     return materialize_storage_subdirs(
-        minio_path,
+        storage_path,
         subdirs=['images', 'json'],
         suffix_map={'images': DATASET_IMAGE_EXTENSIONS, 'json': {'.json'}},
         clean=True
@@ -349,14 +287,23 @@ def materialize_minio_dataset_dir(minio_path, split_name):
 
 
 def resolve_dataset_dir_for_conversion(dataset_path, split_name):
-    """解析 json2txt 所需的数据目录，MinIO路径只下载JSON对象"""
+    """解析 json2txt 所需的数据目录"""
     return materialize_dataset_dir_for_conversion(dataset_path, split_name)
 
 trainer_config = TrainerConfig()
 DB_CONFIG = trainer_config.get_db_config()
-STORAGE_BUCKET = trainer_config.get_minio_config().get('bucket', 'algorithm')
-STORAGE_BASE_PATH = trainer_config.get_minio_config().get('base_path', 'trainer')
-TRAINER_WORK_ROOT = os.environ.get('TRAINER_WORK_ROOT', '/data/trainer_work')
+DATA_ROOT = trainer_config.get_data_root()
+PROCESS_CALLBACK_BASE_URL = trainer_config.get_process_callback_base_url()
+PROCESS_CALLBACK_PATH = '/system/trainTask/open/process-callback'
+PROCESS_CALLBACK_TIMEOUT = 10
+DATASET_BUILD_WATCHDOG_INTERVAL = 60
+DATASET_BUILD_WATCHDOG_IDLE_SECONDS = {
+    'build': 600,
+    'configure': 300,
+}
+DATASET_BUILD_PROGRESS_FILE_INTERVAL = 100
+DATASET_BUILD_PROGRESS_SECONDS_INTERVAL = 5
+STORAGE_OBJECT_KEY_PREFIX = os.environ.get('TRAINER_STORAGE_OBJECT_KEY_PREFIX', 'algorithm/trainer')
 MODEL_CONVERT_CONTAINER_ID = os.environ.get('MODEL_CONVERT_CONTAINER_ID', '96350d6935d8')
 MODEL_CONVERT_CONTAINER_WORKDIR = os.environ.get('MODEL_CONVERT_CONTAINER_WORKDIR', '/workspace')
 MODEL_CONVERT_SUPPORTED_PLATFORMS = {'bm1684', 'bm1684x', 'rk3588'}
@@ -375,149 +322,139 @@ MODEL_CONVERT_STATUS_FAILED = 3
 _running_processes_lock = threading.Lock()
 _preloaded_models_lock = threading.Lock()
 _model_info_lock = threading.Lock()
+_model_convert_tasks_lock = threading.Lock()
 
 running_processes = {}
 preloaded_models = {}
 model_info = {}
+model_convert_tasks = {}
 
 
-def build_storage_minio_path(*parts):
-    """构造对象存储标准路径，例如 minio://algorithm/trainer/train_data/123"""
-    normalized_parts = [str(part).strip().strip('/') for part in parts if str(part).strip()]
-    object_path = '/'.join([STORAGE_BASE_PATH.strip('/')] + normalized_parts)
-    return PathHandler.build_minio_uri(STORAGE_BUCKET, object_path)
+def build_storage_path(*parts):
+    """构造本地数据路径，例如 /data/Sucai1/algorithm/trainer/train_data/123"""
+    return PathHandler.build_data_path(*parts)
 
 
-def build_storage_local_path(*parts, require_exists=False) -> Path:
-    """返回训练服务本地工作区路径，不再指向RustFS后端数据目录"""
-    normalized_parts = [str(part).strip().strip('/') for part in parts if str(part).strip()]
-    local_path = Path(TRAINER_WORK_ROOT) / STORAGE_BUCKET / STORAGE_BASE_PATH.strip('/')
-    for part in normalized_parts:
-        local_path = local_path / part
-    if require_exists and not local_path.exists():
-        raise FileNotFoundError(f"本地工作区路径不存在: {local_path}")
-    return local_path
-
-
-def local_work_path_for_storage_uri(storage_uri: str) -> Path:
-    """把 minio://bucket/object 映射到训练服务本地工作区路径"""
-    bucket, object_path = PathHandler.parse_minio_path(storage_uri)
-    local_path = Path(TRAINER_WORK_ROOT) / bucket
-    if object_path:
-        local_path = local_path / object_path
-    return local_path
+def build_storage_local_path(*parts, require_exists=False):
+    """构造本地数据路径，返回 Path 对象，支持 require_exists 参数"""
+    path_str = PathHandler.resolve_local_path(*parts, require_exists=require_exists)
+    return Path(path_str)
 
 
 def normalize_address_for_db(path: str) -> str:
-    """优先将本地工作区路径转换回 minio://，保证数据库统一存对象路径"""
-    try:
-        local_path_obj = Path(path).resolve()
-        work_bucket_root = (Path(TRAINER_WORK_ROOT) / STORAGE_BUCKET).resolve()
-        relative_path = local_path_obj.relative_to(work_bucket_root)
-        return PathHandler.build_minio_uri(STORAGE_BUCKET, relative_path.as_posix())
-    except Exception:
-        pass
-
-    converted_path = PathHandler.convert_local_to_minio_path(path, require_within_root=False)
-    return converted_path or str(path)
+    """返回本地路径（兼容旧的远程 URI）"""
+    return ensure_local_path(path)
 
 
-def build_storage_object_key(*parts) -> str:
-    """构造不带 bucket 的对象路径，例如 trainer/original_dataset/123/train/images/a.jpg"""
-    normalized_parts = [STORAGE_BASE_PATH.strip('/')]
-    normalized_parts.extend(str(part).strip().strip('/') for part in parts if str(part).strip())
-    return '/'.join(part for part in normalized_parts if part)
+def normalize_storage_path_for_db(path: str):
+    """将本地绝对路径转换为数据库中的 algorithm/trainer 相对路径"""
+    if path is None:
+        return None
+
+    path_str = str(path).strip().replace('\\', '/')
+    if not path_str:
+        return None
+
+    for legacy_prefix in LEGACY_STORAGE_PREFIXES:
+        if path_str.startswith(legacy_prefix):
+            path_str = path_str[len(legacy_prefix):].lstrip('/')
+            break
+
+    prefix = str(STORAGE_OBJECT_KEY_PREFIX).strip('/').replace('\\', '/')
+    if path_str == prefix or path_str.startswith(f'{prefix}/'):
+        return path_str.strip('/')
+
+    prefix_index = path_str.find(prefix)
+    if prefix_index >= 0:
+        return path_str[prefix_index:].strip('/')
+
+    if path_str.startswith('/'):
+        return path_str.lstrip('/')
+
+    return f"{prefix}/{path_str.lstrip('/')}"
 
 
-def get_minio_manager_or_raise():
-    manager = get_minio_manager()
-    if not manager or not manager.client:
-        raise RuntimeError("RustFS/MinIO客户端未初始化")
-    return manager
+def resolve_storage_path_to_local(path: str):
+    """normalize_storage_path_for_db 的逆操作：把数据库中保存的相对路径还原为本地绝对路径"""
+    if path is None:
+        return None
+
+    path_str = str(path).strip()
+    if not path_str:
+        return path_str
+
+    return ensure_local_path(path_str)
 
 
-def parse_storage_object_path(path: str) -> str:
-    """将 minio://bucket/object 或对象路径统一为 object_path"""
-    path = str(path or '').strip()
-    if PathHandler.is_minio_path(path):
-        bucket, object_path = PathHandler.parse_minio_path(path)
-        if bucket != STORAGE_BUCKET:
-            raise ValueError(f"不支持的bucket: {bucket}，当前bucket={STORAGE_BUCKET}")
-        return object_path.strip('/')
-    return path.strip('/')
+def _resolve_path(path: str) -> Path:
+    """将相对路径解析为基于数据根目录的绝对路径"""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return Path(PathHandler.get_data_root()) / p
 
 
-def list_storage_objects(prefix: str, suffixes=None):
-    """通过 S3 API 列出对象，忽略目录占位对象"""
-    manager = get_minio_manager_or_raise()
-    normalized_prefix = parse_storage_object_path(prefix).rstrip('/')
-    if normalized_prefix:
-        normalized_prefix += '/'
+def list_local_files(directory: str, suffixes=None):
+    """列出本地目录下的文件（仅顶层，不递归），返回带目录前缀的相对路径"""
+    dir_path = _resolve_path(directory)
+    if not dir_path.exists():
+        return []
 
-    object_names = manager.list_objects(prefix=normalized_prefix, recursive=True)
+    data_root = Path(PathHandler.get_data_root())
     results = []
-    for object_name in object_names:
-        if not object_name or object_name.endswith('/'):
+    for file_path in dir_path.iterdir():
+        if not file_path.is_file():
             continue
-        if suffixes and Path(object_name).suffix.lower() not in suffixes:
+        if suffixes and file_path.suffix.lower() not in suffixes:
             continue
-        results.append(object_name)
+        # 返回相对于数据根目录的完整路径
+        results.append(str(file_path.relative_to(data_root)))
     return sorted(results)
 
 
-def read_storage_object_bytes(object_name: str) -> bytes:
-    manager = get_minio_manager_or_raise()
-    response = manager.client.get_object(manager.bucket_name, parse_storage_object_path(object_name))
-    try:
-        return response.read()
-    finally:
-        response.close()
-        response.release_conn()
+def read_local_file(file_path: str) -> bytes:
+    """读取本地文件"""
+    return _resolve_path(file_path).read_bytes()
 
 
-def read_storage_json_object(object_name: str):
-    raw_bytes = read_storage_object_bytes(object_name)
-    return json.loads(raw_bytes.decode('utf-8'))
+def read_local_json(file_path: str):
+    """读取本地 JSON 文件"""
+    return json.loads(_resolve_path(file_path).read_text(encoding='utf-8'))
 
 
-def put_storage_bytes(object_name: str, data: bytes, content_type='application/octet-stream'):
-    manager = get_minio_manager_or_raise()
-    object_path = parse_storage_object_path(object_name)
-    manager.client.put_object(
-        manager.bucket_name,
-        object_path,
-        BytesIO(data),
-        length=len(data),
-        content_type=content_type
-    )
-    logger.debug(f"对象写入成功: {manager.bucket_name}/{object_path}")
+def write_local_file(file_path: str, data: bytes):
+    """写入本地文件"""
+    p = _resolve_path(file_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
 
 
-def put_storage_json_object(object_name: str, data):
-    body = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
-    put_storage_bytes(object_name, body, content_type='application/json')
+def write_local_json(file_path: str, data):
+    """写入本地 JSON 文件"""
+    p = _resolve_path(file_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def delete_storage_object(object_name: str):
-    manager = get_minio_manager_or_raise()
-    object_path = parse_storage_object_path(object_name)
-    manager.client.remove_object(manager.bucket_name, object_path)
-    logger.info(f"对象删除成功: {manager.bucket_name}/{object_path}")
+def delete_local_file(file_path: str):
+    """删除本地文件"""
+    p = _resolve_path(file_path)
+    if p.exists():
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+        logger.info(f"文件删除成功: {file_path}")
 
 
-def upload_file_to_storage(local_path: Path, object_name: str, content_type='application/octet-stream'):
-    manager = get_minio_manager_or_raise()
+def copy_file_to_storage(local_path: Path, target_path: str):
+    """复制文件到存储目录"""
     local_path = Path(local_path)
-    object_path = parse_storage_object_path(object_name)
-    with open(local_path, 'rb') as file_data:
-        manager.client.put_object(
-            manager.bucket_name,
-            object_path,
-            file_data,
-            length=local_path.stat().st_size,
-            content_type=content_type
-        )
-    return PathHandler.build_minio_uri(manager.bucket_name, object_path)
+    target = _resolve_path(str(target_path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(local_path), str(target))
+    logger.debug(f"文件复制成功: {local_path} -> {target}")
+    return str(target)
 
 
 def file_sha256(local_path: Path) -> str:
@@ -528,129 +465,266 @@ def file_sha256(local_path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_storage_object_matches_file(local_path: Path, object_name: str):
-    """上传后立即通过S3读回校验，避免后续链路拿到损坏对象"""
-    local_path = Path(local_path)
-    object_path = parse_storage_object_path(object_name)
-    object_bytes = read_storage_object_bytes(object_path)
-    local_size = local_path.stat().st_size
-    local_hash = file_sha256(local_path)
-    object_hash = hashlib.sha256(object_bytes).hexdigest()
-
-    if len(object_bytes) != local_size or object_hash != local_hash:
-        raise RuntimeError(
-            f"对象存储校验失败: object={object_path}, "
-            f"local_size={local_size}, object_size={len(object_bytes)}, "
-            f"local_sha256={local_hash}, object_sha256={object_hash}"
-        )
-
-    logger.info(
-        f"对象存储校验成功: object={object_path}, size={local_size}, sha256={local_hash}"
-    )
-    return {
-        'size': local_size,
-        'sha256': local_hash
-    }
-
-
-def upload_directory_to_storage(local_dir: Path, prefix: str):
-    manager = get_minio_manager_or_raise()
+def copy_directory_to_storage(
+    local_dir: Path,
+    target_dir: str,
+    progress_callback=None,
+    progress_file_interval: int = DATASET_BUILD_PROGRESS_FILE_INTERVAL,
+    progress_seconds_interval: int = DATASET_BUILD_PROGRESS_SECONDS_INTERVAL,
+):
+    """复制目录到存储目录"""
     local_dir = Path(local_dir)
-    object_prefix = parse_storage_object_path(prefix).rstrip('/')
+    target = _resolve_path(str(target_dir))
     success_count = 0
     fail_count = 0
     failed_files = []
+    files_to_copy = [file_path for file_path in local_dir.rglob('*') if file_path.is_file()]
+    total_files = len(files_to_copy)
+    processed_files = 0
+    last_progress_time = time.time()
 
-    for file_path in local_dir.rglob('*'):
-        if not file_path.is_file():
-            continue
-        relative_path = file_path.relative_to(local_dir).as_posix()
-        object_name = f"{object_prefix}/{relative_path}" if object_prefix else relative_path
+    if progress_callback:
+        progress_callback(processed_files, total_files)
+
+    for file_path in files_to_copy:
+        relative_path = file_path.relative_to(local_dir)
+        target_file = target / relative_path
         try:
-            upload_file_to_storage(file_path, object_name)
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(file_path), str(target_file))
             success_count += 1
         except Exception as e:
-            logger.error(f"上传对象失败: {file_path} -> {object_name}, error={str(e)}")
+            logger.error(f"复制文件失败: {file_path} -> {target_file}, error={e}")
             fail_count += 1
             failed_files.append(str(file_path))
+        finally:
+            processed_files += 1
+            now = time.time()
+            should_report = (
+                progress_callback
+                and (
+                    processed_files == total_files
+                    or processed_files % progress_file_interval == 0
+                    or now - last_progress_time >= progress_seconds_interval
+                )
+            )
+            if should_report:
+                progress_callback(processed_files, total_files)
+                last_progress_time = now
 
     return success_count, fail_count, failed_files
 
 
-def download_storage_prefix(prefix: str, local_dir: Path, suffixes=None):
-    """按前缀下载对象到本地目录，保留相对路径"""
-    object_prefix = parse_storage_object_path(prefix).rstrip('/')
-    object_names = list_storage_objects(object_prefix, suffixes=suffixes)
-    local_dir = Path(local_dir)
-    if local_dir.exists():
-        safe_rmtree(local_dir)
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    for object_name in object_names:
-        relative_name = object_name[len(object_prefix):].lstrip('/') if object_prefix else object_name
-        local_path = local_dir / relative_name
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(read_storage_object_bytes(object_name))
-
-    return len(object_names)
-
-
-def delete_storage_prefix(prefix: str):
-    object_names = list_storage_objects(prefix)
-    for object_name in object_names:
-        delete_storage_object(object_name)
-    return len(object_names)
-
-
-def materialize_storage_subdirs(minio_path: str, subdirs, suffix_map=None, clean=True) -> str:
-    """按对象前缀把指定子目录下载到本地工作区"""
-    object_path = parse_storage_object_path(minio_path)
-    local_root = local_work_path_for_storage_uri(PathHandler.build_minio_uri(STORAGE_BUCKET, object_path))
+def materialize_local_subdirs(local_path: str, subdirs, suffix_map=None, clean=True) -> str:
+    """确保本地目录下的子目录存在"""
+    local_root = Path(local_path)
     if clean and local_root.exists():
         safe_rmtree(local_root)
     local_root.mkdir(parents=True, exist_ok=True)
 
     for subdir in subdirs:
-        suffixes = suffix_map.get(subdir) if suffix_map else None
-        count = download_storage_prefix(f"{object_path}/{subdir}", local_root / subdir, suffixes=suffixes)
-        logger.info(f"已下载对象前缀: {object_path}/{subdir} -> {local_root / subdir}, count={count}")
+        sub_dir = local_root / subdir
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        count = len(list(sub_dir.rglob('*'))) if sub_dir.exists() else 0
+        logger.info(f"子目录就绪: {sub_dir}, 文件数={count}")
 
     return str(local_root)
 
 
-def materialize_dataset_dir_for_conversion(dataset_path, split_name):
-    """json2txt只需要JSON对象，不需要下载图片"""
-    if PathHandler.is_minio_path(dataset_path):
-        local_dir = materialize_storage_subdirs(
-            dataset_path,
-            subdirs=['json'],
-            suffix_map={'json': {'.json'}},
-            clean=True
-        )
-    else:
-        local_dir = str(dataset_path)
+# 兼容旧函数名
+materialize_storage_subdirs = materialize_local_subdirs
 
+
+def parse_storage_relative_path(path):
+    """将存储地址解析为本地绝对路径。
+
+    历史上这里返回"去掉前导斜杠的相对键"，但本地存储迁移后该形态既不是
+    合法的数据根相对键，也不是绝对路径：传给 _resolve_path 会被二次拼接到
+    数据根目录下（/data/.../trainer/data/.../trainer/...），导致删除/复制
+    目标错位、旧结果残留。
+
+    现统一返回本地绝对路径（DB 相对键/旧远程 URI <-> 本地绝对路径），
+    与 delete_storage_prefix / upload_directory_to_storage 等同走 _resolve_path
+    的语义保持一致。
+    """
+    return ensure_local_path(str(path or '').strip())
+
+
+_unused_storage_manager = lambda: None
+read_storage_object_bytes = read_local_file
+read_storage_json_object = read_local_json
+put_storage_bytes = write_local_file
+put_storage_json_object = write_local_json
+delete_storage_object = delete_local_file
+list_storage_objects = list_local_files
+upload_file_to_storage = copy_file_to_storage
+upload_directory_to_storage = copy_directory_to_storage
+
+
+def copy_directory_files_parallel(
+    src_dir: Path,
+    dest_dir: Path,
+    max_workers: int = 16,
+    progress_callback=None,
+    progress_file_interval: int = DATASET_BUILD_PROGRESS_FILE_INTERVAL,
+    progress_seconds_interval: int = DATASET_BUILD_PROGRESS_SECONDS_INTERVAL,
+) -> int:
+    """并行复制目录中的一级文件"""
+    src_dir = Path(src_dir)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    files_to_copy = [file_path for file_path in src_dir.iterdir() if file_path.is_file()]
+    total_files = len(files_to_copy)
+    if progress_callback:
+        progress_callback(0, total_files)
+    if not files_to_copy:
+        return 0
+
+    def copy_file(file_path: Path) -> bool:
+        target_file = dest_dir / file_path.name
+        try:
+            shutil.copy2(str(file_path), str(target_file))
+            return True
+        except Exception as e:
+            logger.error(f"复制文件失败: {file_path} -> {target_file}, error={e}")
+            return False
+
+    success_count = 0
+    processed_files = 0
+    last_progress_time = time.time()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(copy_file, file_path) for file_path in files_to_copy]
+        for future in as_completed(futures):
+            processed_files += 1
+            if future.result():
+                success_count += 1
+            now = time.time()
+            should_report = (
+                progress_callback
+                and (
+                    processed_files == total_files
+                    or processed_files % progress_file_interval == 0
+                    or now - last_progress_time >= progress_seconds_interval
+                )
+            )
+            if should_report:
+                progress_callback(processed_files, total_files)
+                last_progress_time = now
+
+    return success_count
+
+
+def build_storage_object_key(*parts) -> str:
+    """构造本地数据根目录下的相对路径键"""
+    normalized = [str(part).strip().strip('/') for part in parts if str(part).strip()]
+    return '/'.join(normalized)
+
+
+def build_storage_db_object_key(*parts) -> str:
+    """构造写入数据库的对象键，例如 algorithm/trainer/original_dataset/123/train/images/a.jpg"""
+    normalized = [str(STORAGE_OBJECT_KEY_PREFIX).strip().strip('/')]
+    normalized.extend(str(part).strip().strip('/') for part in parts if str(part).strip())
+    return '/'.join(part for part in normalized if part)
+
+
+def build_process_callback_url(base_url: str) -> str:
+    """构造数据处理完成回调地址"""
+    base_url = str(base_url or '').strip().rstrip('/')
+    if not base_url:
+        return ''
+    return f"{base_url}{PROCESS_CALLBACK_PATH}"
+
+
+def send_process_callback(dataset_id, success, message=None):
+    """向 uav-server 回调数据集处理结果"""
+    callback_url = build_process_callback_url(PROCESS_CALLBACK_BASE_URL)
+    if not callback_url:
+        logger.warning(f"未配置数据处理回调地址，跳过回调: dataset_id={dataset_id}, success={success}")
+        return False
+
+    payload = {
+        'datasetId': int(dataset_id),
+        'success': bool(success),
+        'message': None if success else (str(message or '')[:500] or None)
+    }
+    request_data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    request = urllib.request.Request(
+        callback_url,
+        data=request_data,
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=PROCESS_CALLBACK_TIMEOUT) as response:
+            response_text = response.read().decode('utf-8').strip()
+            status_code = response.getcode()
+
+        if status_code != 200:
+            raise RuntimeError(f"HTTP {status_code}")
+
+        response_data = json.loads(response_text) if response_text else {}
+        if response_data.get('code') != 0:
+            raise RuntimeError(f"callback code={response_data.get('code')}, body={response_text or 'empty'}")
+
+        logger.info(
+            f"数据处理回调成功: dataset_id={dataset_id}, success={success}, callback_url={callback_url}"
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            f"数据处理回调失败: dataset_id={dataset_id}, success={success}, callback_url={callback_url}, error={e}"
+        )
+        return False
+
+
+def verify_storage_object_matches_file(local_path, target_path):
+    """本地模式下校验文件存在与大小"""
+    local_path = _resolve_path(str(local_path))
+    target = _resolve_path(str(target_path)) if target_path else local_path
+    if not target.exists():
+        raise RuntimeError(f"文件不存在: {target}")
+    size = target.stat().st_size
+    digest = file_sha256(target)
+    logger.info(f"文件校验成功: path={target}, size={size}, sha256={digest}")
+    return {'size': size, 'sha256': digest}
+
+
+def download_storage_prefix(prefix: str, local_dir: Path, suffixes=None):
+    """兼容旧接口：本地模式下数据已在本地，只列出文件数"""
+    source_dir = _resolve_path(prefix)
+    if not source_dir.exists():
+        return 0
+    files = list_local_files(str(source_dir), suffixes=suffixes)
+    return len(files)
+
+
+def delete_storage_prefix(prefix: str):
+    """删除本地目录前缀下的所有文件"""
+    dir_path = _resolve_path(prefix)
+    if dir_path.exists():
+        shutil.rmtree(dir_path)
+        logger.info(f"目录删除成功: {prefix}")
+    return 0
+
+
+def materialize_dataset_dir_for_conversion(dataset_path, split_name):
+    """json2txt 所需的数据目录"""
+    local_dir = ensure_local_path(dataset_path)
     local_path = Path(local_dir)
     json_dir = local_path / 'json'
     if not json_dir.exists():
         raise FileNotFoundError(f"{split_name} json目录不存在: {json_dir}")
-    # UnifiedJsonConverter 会校验 images 目录存在；json2txt 实际只依赖 JSON 中的宽高。
     (local_path / 'images').mkdir(parents=True, exist_ok=True)
     return str(local_path)
 
 
 def materialize_dataset_dir_for_create(dataset_path, split_name):
     """构建训练集需要真实 images 和 labels 文件"""
-    if PathHandler.is_minio_path(dataset_path):
-        local_dir = materialize_storage_subdirs(
-            dataset_path,
-            subdirs=['images', 'labels'],
-            suffix_map={'images': DATASET_IMAGE_EXTENSIONS, 'labels': {'.txt'}},
-            clean=True
-        )
-    else:
-        local_dir = str(dataset_path)
-
+    local_dir = ensure_local_path(dataset_path)
     local_path = Path(local_dir)
     images_dir = local_path / 'images'
     labels_dir = local_path / 'labels'
@@ -661,37 +735,37 @@ def materialize_dataset_dir_for_create(dataset_path, split_name):
     return str(local_path)
 
 
-def upload_converted_labels(local_dataset_dir, minio_dataset_path):
-    """上传 json2txt 生成的 labels/classes/class_mapping 到原始split对象前缀"""
-    if not PathHandler.is_minio_path(minio_dataset_path):
-        return
-
-    local_dataset_dir = Path(local_dataset_dir)
-    object_path = parse_storage_object_path(minio_dataset_path)
+def upload_converted_labels(local_dataset_dir, dataset_path):
+    """复制 json2txt 生成的 labels/classes/class_mapping 到目标目录"""
+    local_dataset_dir = Path(local_dataset_dir).resolve()
+    target_dir = Path(ensure_local_path(dataset_path)).resolve()
 
     labels_dir = local_dataset_dir / 'labels'
     if labels_dir.exists():
-        delete_storage_prefix(f"{object_path}/labels")
-        success_count, fail_count, failed_files = upload_directory_to_storage(labels_dir, f"{object_path}/labels")
-        if fail_count:
-            raise RuntimeError(f"上传labels失败: fail_count={fail_count}, failed_files={failed_files[:5]}")
-        logger.info(f"labels已上传到对象存储: {object_path}/labels, count={success_count}")
+        target_labels = target_dir / 'labels'
+        if labels_dir != target_labels:
+            if target_labels.exists():
+                shutil.rmtree(target_labels)
+            shutil.copytree(str(labels_dir), str(target_labels))
+            logger.info(f"labels 目录复制完成: {labels_dir} -> {target_labels}")
 
     for file_name in ('classes.txt', 'class_mapping.json'):
         local_file = local_dataset_dir / file_name
         if local_file.exists():
-            upload_file_to_storage(local_file, f"{object_path}/{file_name}")
+            target_file = target_dir / file_name
+            if local_file != target_file:
+                shutil.copy2(str(local_file), str(target_file))
 
 
-def get_storage_image_size(object_name: str):
+def get_storage_image_size(file_path: str):
+    """读取图片尺寸"""
     try:
         from PIL import Image
 
-        image_bytes = read_storage_object_bytes(object_name)
-        with Image.open(BytesIO(image_bytes)) as img:
+        with Image.open(_resolve_path(file_path)) as img:
             return img.size
     except Exception as e:
-        logger.warning(f"读取对象图片尺寸失败: {object_name}, error={str(e)}")
+        logger.warning(f"读取图片尺寸失败: {file_path}, error={e}")
         return None
 
 
@@ -754,23 +828,20 @@ def list_dataset_images(images_dir: Path):
 
 def infer_shape_type(shape):
     """推断单个标注的类型，兼容缺失 shape_type 的 JSON"""
-    shape_type = str(shape.get('shape_type') or '').strip().lower()
-    if shape_type:
-        return shape_type
-
-    points = shape.get('points') or []
-    if len(points) == 2:
-        return 'rectangle'
-    if len(points) >= 3:
-        return 'polygon'
-    return None
+    return infer_pose_shape_type(shape)
 
 
 def detect_draw_type_from_shapes(shape_types):
-    """根据一组 shape_type 推断 draw_type"""
+    """根据一组 shape_type 推断 draw_type
+
+    判断优先级：含 point => 'point'（pose 数据集），rectangle+polygon => 'mix'，
+    单一 polygon => 'polygon'，否则 'rectangle'。
+    """
     normalized_types = {shape_type for shape_type in shape_types if shape_type}
     if not normalized_types:
         return 'rectangle'
+    if 'point' in normalized_types:
+        return 'point'
     if 'polygon' in normalized_types and 'rectangle' in normalized_types:
         return 'mix'
     if 'polygon' in normalized_types:
@@ -791,7 +862,7 @@ def format_percentage_dict(counter_dict, total_count):
 
 
 def repair_and_collect_split_stats(dataset_id, split_name, data_type):
-    """通过 S3 API 修复单个 split 的 images/json 对应关系，并统计标签信息"""
+    """基于本地路径修复单个 split 的 images/json 对应关系，并统计标签信息"""
     split_prefix = build_storage_object_key('original_dataset', str(dataset_id), split_name)
     images_prefix = f"{split_prefix}/images"
     json_prefix = f"{split_prefix}/json"
@@ -800,12 +871,12 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
     for object_name in list_storage_objects(images_prefix, suffixes=DATASET_IMAGE_EXTENSIONS):
         stem = Path(object_name).stem
         if stem in image_objects:
-            logger.warning(f"检测到同名图片 stem 冲突，忽略后续对象: {object_name}，保留: {image_objects[stem]}")
+            logger.warning(f"检测到同名图片 stem 冲突，忽略后续文件: {object_name}，保留: {image_objects[stem]}")
             continue
         image_objects[stem] = object_name
 
     if not image_objects:
-        raise FileNotFoundError(f"{split_name} images对象不存在或为空: {images_prefix}")
+        raise FileNotFoundError(f"{split_name} images目录不存在或为空: {images_prefix}")
 
     json_objects = {
         Path(object_name).stem: object_name
@@ -821,7 +892,7 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
             delete_storage_object(json_object)
             removed_json_files.append(Path(json_object).name)
             json_objects.pop(stem, None)
-            logger.info(f"删除无对应图片的JSON对象: {json_object}")
+            logger.info(f"删除无对应图片的JSON文件: {json_object}")
 
     for stem, image_object in image_objects.items():
         if stem in json_objects:
@@ -841,28 +912,65 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
         put_storage_json_object(negative_json_object, negative_json)
         json_objects[stem] = negative_json_object
         created_negative_json_files.append(Path(negative_json_object).name)
-        logger.info(f"为缺少标注的图片生成负样本JSON对象: {image_object} -> {negative_json_object}")
+        logger.info(f"为缺少标注的图片生成负样本JSON文件: {image_object} -> {negative_json_object}")
 
     label_counter = Counter()
     label_order = []
     label_cover_map = {}
     shape_types = []
+    # pose 相关：每个矩形对应的关键点标签集合 + 整个 split 出现过的关键点标签
+    keypoint_labels_in_split = []  # 保留首次出现顺序
+
+    parsed_entries = []
+    split_has_point = False
 
     for stem in sorted(json_objects.keys()):
         json_object = json_objects[stem]
         try:
             data = read_storage_json_object(json_object)
         except Exception as e:
-            logger.error(f"读取JSON对象失败: {json_object}, error={str(e)}")
+            logger.error(f"读取JSON文件失败: {json_object}, error={str(e)}")
             failed_json_files.append({'object': json_object, 'error': str(e)})
             continue
 
         shapes = data.get('shapes') or []
-        labels_in_file = []
+        assignment = assign_points_to_rectangles(shapes)
+        parsed_entries.append((stem, json_object, shapes, assignment))
+        shape_types.extend(assignment.shape_types)
+        if 'point' in assignment.shape_types:
+            split_has_point = True
 
+        for kp_label in assignment.keypoint_labels:
+            if kp_label not in keypoint_labels_in_split:
+                keypoint_labels_in_split.append(kp_label)
+
+        if assignment.unassigned_points:
+            logger.warning(
+                f"{json_object} 存在 {len(assignment.unassigned_points)} 个框外 point，"
+                f"不计入 kpt_labels: {[point.label for point in assignment.unassigned_points[:5]]}"
+            )
+        if assignment.duplicate_points:
+            logger.warning(
+                f"{json_object} 存在 {len(assignment.duplicate_points)} 个重复 point，"
+                f"统计时保留首个: {[point.label for point in assignment.duplicate_points[:5]]}"
+            )
+
+    for stem, json_object, shapes, assignment in parsed_entries:
+        labels_in_file = []
         for shape in shapes:
             label_name = str(shape.get('label') or '').strip()
             if not label_name:
+                continue
+
+            shape_type = infer_shape_type(shape)
+
+            # point 类型不计入"类别"统计，而是作为关键点标签收集
+            if shape_type == 'point':
+                continue
+
+            # 一旦 split 中出现 point，整体按 pose 数据处理：仅 rectangle 作为目标类别。
+            # polygon 等形状不参与 pose 类别统计，也不会进入 YOLO pose TXT。
+            if split_has_point and shape_type != 'rectangle':
                 continue
 
             if label_name not in label_counter:
@@ -870,12 +978,10 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
             label_counter[label_name] += 1
             labels_in_file.append(label_name)
 
-            shape_type = infer_shape_type(shape)
-            if shape_type:
-                shape_types.append(shape_type)
-
         if labels_in_file and stem in image_objects:
-            object_key = image_objects[stem]
+            object_key = build_storage_db_object_key(
+                'original_dataset', str(dataset_id), split_name, 'images', Path(image_objects[stem]).name
+            )
             for label_name in dict.fromkeys(labels_in_file):
                 label_cover_map.setdefault(label_name, object_key)
 
@@ -897,7 +1003,7 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
 
     return {
         'split_name': split_name,
-        'split_dir': build_storage_minio_path('original_dataset', str(dataset_id), split_name),
+        'split_dir': build_storage_path('original_dataset', str(dataset_id), split_name),
         'sample_num': len(image_objects),
         'annotation_num': len(json_objects),
         'tag_sum': tag_sum,
@@ -906,6 +1012,7 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
         'draw_type': detect_draw_type_from_shapes(shape_types),
         'label_order': label_order,
         'label_rows': label_rows,
+        'keypoint_labels': keypoint_labels_in_split,
         'repair': {
             'removed_json_files': removed_json_files,
             'created_negative_json_files': created_negative_json_files,
@@ -915,36 +1022,70 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
 
 
 def normalize_label_mapping(label_mapping):
-    """标准化标签映射，空字符串/null 代表删除该标签"""
+    """标准化标签映射，空字符串/None 都代表删除该标签
+
+    value 支持两种写法：
+    - 字符串/None：匹配所有 shape_type 下的同名 label
+    - dict：{"new_label": <str|None>, "shape_type": <str|None>}
+        new_label 缺失/None/空串 → 删除
+        shape_type 缺失/None → 匹配所有形状
+        shape_type 给值（point/rectangle/polygon 等）→ 只匹配 shape.shape_type 等于该值的形状
+    """
     if not isinstance(label_mapping, dict) or not label_mapping:
-        raise ValueError("label_mapping 必须是非空对象，例如 {'旧标签': '新标签', '待删除标签': ''}")
+        raise ValueError(
+            "label_mapping 必须是非空对象，例如 {'旧标签': '新标签', '待删除标签': '', "
+            "'关键点A': {'new_label': '关键点B', 'shape_type': 'point'}}"
+        )
 
     normalized_mapping = {}
-    for old_label, new_label in label_mapping.items():
+    for old_label, raw_value in label_mapping.items():
         normalized_old_label = str(old_label).strip()
         if not normalized_old_label:
             raise ValueError("label_mapping 中存在空的原标签名")
 
-        if new_label is None:
-            normalized_mapping[normalized_old_label] = None
-            continue
+        if isinstance(raw_value, dict):
+            new_label_raw = raw_value.get('new_label')
+            shape_type_raw = raw_value.get('shape_type')
+        elif raw_value is None or isinstance(raw_value, (str, int, float)):
+            new_label_raw = raw_value
+            shape_type_raw = None
+        else:
+            raise ValueError(
+                f"label_mapping['{normalized_old_label}'] 的值类型不支持，仅支持字符串/None/对象"
+            )
 
-        normalized_new_label = str(new_label).strip()
-        normalized_mapping[normalized_old_label] = normalized_new_label or None
+        if new_label_raw is None:
+            target_label = None
+        else:
+            normalized_new_label = str(new_label_raw).strip()
+            target_label = normalized_new_label or None
+
+        if shape_type_raw is None:
+            shape_type_filter = None
+        else:
+            normalized_shape_type = str(shape_type_raw).strip().lower()
+            shape_type_filter = normalized_shape_type or None
+
+        normalized_mapping[normalized_old_label] = {
+            'target_label': target_label,
+            'shape_type_filter': shape_type_filter,
+        }
 
     return normalized_mapping
 
 
 def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
-    """通过 S3 API 批量修改单个 split/json 前缀中的标签"""
+    """基于本地路径批量修改单个 split/json 目录中的标签，可按 shape_type 过滤"""
     json_prefix = build_storage_object_key('original_dataset', str(dataset_id), split_name, 'json')
     json_objects = list_storage_objects(json_prefix, suffixes={'.json'})
     operation_stats = {}
-    for old_label, new_label in label_mapping.items():
+    for old_label, config in label_mapping.items():
+        target_label = config['target_label']
         operation_stats[old_label] = {
-            'target_label': new_label,
-            'action': 'delete' if new_label is None else 'rename',
-            'matched_shapes': 0
+            'target_label': target_label,
+            'shape_type_filter': config['shape_type_filter'],
+            'action': 'delete' if target_label is None else 'rename',
+            'matched_shapes': 0,
         }
 
     result = {
@@ -971,27 +1112,32 @@ def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
                     updated_shapes.append(shape)
                     continue
 
-                old_label = str(shape.get('label') or '').strip()
-                if old_label not in label_mapping:
+                shape_label = str(shape.get('label') or '').strip()
+                if not shape_label or shape_label not in label_mapping:
                     updated_shapes.append(shape)
                     continue
 
-                target_label = label_mapping[old_label]
-                operation_stats[old_label]['matched_shapes'] += 1
+                config = label_mapping[shape_label]
+                shape_type_filter = config['shape_type_filter']
+                shape_type_value = str(shape.get('shape_type') or '').strip().lower()
+                if shape_type_filter is not None and shape_type_value != shape_type_filter:
+                    updated_shapes.append(shape)
+                    continue
+
+                operation_stats[shape_label]['matched_shapes'] += 1
+                target_label = config['target_label']
 
                 if target_label is None:
                     result['deleted_shapes'] += 1
                     file_modified = True
                     continue
 
-                if target_label == old_label:
-                    updated_shapes.append(shape)
-                    continue
+                if target_label != shape_label:
+                    shape['label'] = target_label
+                    result['renamed_shapes'] += 1
+                    file_modified = True
 
-                shape['label'] = target_label
                 updated_shapes.append(shape)
-                result['renamed_shapes'] += 1
-                file_modified = True
 
             if file_modified:
                 data['shapes'] = updated_shapes
@@ -1037,6 +1183,17 @@ def collect_dataset_stats_result(dataset_id):
     annotation_num = train_stats['annotation_num'] + val_stats['annotation_num']
     labels_json = json.dumps(combined_label_order, ensure_ascii=False)
 
+    # pose 数据集：聚合两个 split 的关键点标签，按出现顺序得到规范关键点列表
+    keypoint_labels = []
+    for split_stats in (train_stats, val_stats):
+        for kp_label in split_stats.get('keypoint_labels', []) or []:
+            if kp_label not in keypoint_labels:
+                keypoint_labels.append(kp_label)
+    # 数字化关键点标签（"1","2","3"）按数值排序，保证 1<2<3 的稳定顺序
+    keypoint_labels = sort_keypoint_labels(keypoint_labels)
+    kpt_num = len(keypoint_labels)
+    is_pose_dataset = draw_type == 'point'
+
     if not db_manager.update_dataset_class_mapping(dataset_id, class_mapping):
         raise RuntimeError("更新train_dataset.class失败")
 
@@ -1060,7 +1217,9 @@ def collect_dataset_stats_result(dataset_id):
         tag_num=json.dumps(total_tag_num, ensure_ascii=False),
         draw_type=draw_type,
         tag_sum=total_tag_sum,
-        tag_percentage=json.dumps(total_tag_percentage, ensure_ascii=False)
+        tag_percentage=json.dumps(total_tag_percentage, ensure_ascii=False),
+        kpt_num=kpt_num if is_pose_dataset else 0,
+        kpt_labels=json.dumps(keypoint_labels if is_pose_dataset else [], ensure_ascii=False),
     ):
         raise RuntimeError("更新train_dataset聚合统计字段失败")
 
@@ -1076,6 +1235,8 @@ def collect_dataset_stats_result(dataset_id):
         'label_num': len(combined_label_order),
         'draw_type': draw_type,
         'class_mapping': class_mapping,
+        'kpt_num': kpt_num,
+        'keypoint_labels': keypoint_labels,
         'train_stats': {
             'sample_num': train_stats['sample_num'],
             'annotation_num': train_stats['annotation_num'],
@@ -1280,29 +1441,34 @@ def resolve_dataset_train_images_dir(dataset_info):
 
 
 def get_train_image_object_prefix_candidates(dataset_info):
-    """根据数据集记录推导训练图片对象前缀，优先走 S3 API 抽样"""
+    """根据数据集记录推导训练图片本地路径候选"""
     candidates = []
 
     def add_prefix(prefix):
-        prefix = str(prefix or '').strip().strip('/')
+        prefix = str(prefix or '').strip()
+        if not prefix:
+            return
+        # 绝对路径保持原样（_resolve_path 会原样返回）；相对键才去掉首尾斜杠
+        if not prefix.startswith('/'):
+            prefix = prefix.strip('/')
         if prefix and prefix not in candidates:
             candidates.append(prefix)
 
-    def add_minio_images_prefix(address):
-        if address and PathHandler.is_minio_path(address):
-            add_prefix(f"{parse_storage_object_path(address)}/images")
+    def add_images_prefix(address):
+        if address and PathHandler.is_legacy_remote_uri(address):
+            add_prefix(f"{parse_storage_relative_path(address)}/images")
 
-    add_minio_images_prefix(dataset_info.get('original_train_data_address'))
+    add_images_prefix(dataset_info.get('original_train_data_address'))
 
     dataset_address = dataset_info.get('dataset_address')
-    if dataset_address and PathHandler.is_minio_path(dataset_address):
-        dataset_object_path = parse_storage_object_path(dataset_address)
+    if dataset_address and PathHandler.is_legacy_remote_uri(dataset_address):
+        dataset_object_path = parse_storage_relative_path(dataset_address)
         add_prefix(f"{dataset_object_path}/datasets/train/images")
         add_prefix(f"{dataset_object_path}/train/images")
 
     original_data_address = dataset_info.get('original_data_address')
-    if original_data_address and PathHandler.is_minio_path(original_data_address):
-        original_object_path = parse_storage_object_path(original_data_address)
+    if original_data_address and PathHandler.is_legacy_remote_uri(original_data_address):
+        original_object_path = parse_storage_relative_path(original_data_address)
         add_prefix(f"{original_object_path}/images")
         original_parent_path = original_object_path.rstrip('/').rsplit('/', 1)[0]
         add_prefix(f"{original_parent_path}/train/images")
@@ -1315,7 +1481,7 @@ def get_train_image_object_prefix_candidates(dataset_info):
 
 
 def copy_random_train_images_from_storage(dataset_info, target_images_dir: Path, sample_count=5):
-    """通过 S3 API 从训练图片对象前缀中随机下载少量图片"""
+    """从训练图片本地路径候选中随机复制少量图片"""
     target_images_dir.mkdir(parents=True, exist_ok=True)
     last_errors = []
 
@@ -1324,11 +1490,11 @@ def copy_random_train_images_from_storage(dataset_info, target_images_dir: Path,
             image_objects = list_storage_objects(image_prefix, suffixes=DATASET_IMAGE_EXTENSIONS)
         except Exception as e:
             last_errors.append(f"{image_prefix}: {str(e)}")
-            logger.warning(f"[模型转换] 列出训练图片对象失败: prefix={image_prefix}, error={str(e)}")
+            logger.warning(f"[模型转换] 列出训练图片文件失败: path={image_prefix}, error={str(e)}")
             continue
 
         if not image_objects:
-            logger.info(f"[模型转换] 训练图片对象前缀为空: {image_prefix}")
+            logger.info(f"[模型转换] 训练图片目录为空: {image_prefix}")
             continue
 
         selected_objects = random.sample(image_objects, min(sample_count, len(image_objects)))
@@ -1346,13 +1512,13 @@ def copy_random_train_images_from_storage(dataset_info, target_images_dir: Path,
             copied_images.append(target_path)
 
         logger.info(
-            f"[模型转换] 已通过S3抽样下载{len(copied_images)}张训练图片: "
+            f"[模型转换] 已从本地路径抽样复制{len(copied_images)}张训练图片: "
             f"{image_prefix} -> {target_images_dir}"
         )
         return copied_images
 
     if last_errors:
-        logger.warning(f"[模型转换] S3训练图片抽样失败详情: {last_errors[:5]}")
+        logger.warning(f"[模型转换] 本地训练图片抽样失败详情: {last_errors[:5]}")
     return []
 
 
@@ -1509,8 +1675,10 @@ def get_rknn_convert_script(duty_type: str) -> Path:
         convert_script = repo_root / 'rknn_model_zoo' / 'examples' / 'yolo11' / 'python' / 'convert.py'
     elif normalized_duty_type == 'segment':
         convert_script = repo_root / 'rknn_model_zoo' / 'examples' / 'yolov8_seg' / 'python' / 'convert.py'
+    elif normalized_duty_type == 'pose':
+        convert_script = repo_root / 'rknn_model_zoo' / 'examples' / 'yolov8_pose' / 'python' / 'convert.py'
     else:
-        raise ValueError(f"RK3588转换暂不支持duty_type={duty_type}，仅支持detect/segment")
+        raise ValueError(f"RK3588转换暂不支持duty_type={duty_type}，仅支持detect/segment/pose")
 
     if not convert_script.exists():
         raise FileNotFoundError(f"RKNN转换脚本不存在: {convert_script}")
@@ -1600,7 +1768,8 @@ class ModelManager:
             
             if model_path.suffix == '.pt':
                 try:
-                    checkpoint = torch.load(model_path, map_location='cpu')
+                    # 本地预训练模型文件，非用户上传，weights_only=False 是安全的
+                    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
                     if 'model' not in checkpoint and 'state_dict' not in checkpoint:
                         try:
                             model = YOLO(str(model_path))
@@ -1718,7 +1887,7 @@ try:
 except Exception as e:
     logger.error(f"模型初始化失败: {str(e)}")
 
-def upload_to_minio_and_get_path(local_path, folder_type, sub_folder=None):
+def copy_to_storage_and_get_path(local_path, folder_type, sub_folder=None):
     try:
         local_path_obj = Path(local_path).resolve()
         file_name = Path(local_path).name
@@ -1727,20 +1896,20 @@ def upload_to_minio_and_get_path(local_path, folder_type, sub_folder=None):
             path_parts.append(str(sub_folder))
         path_parts.append(file_name)
 
-        target_minio_path = build_storage_minio_path(*path_parts)
-        upload_file_to_storage(local_path_obj, parse_storage_object_path(target_minio_path))
+        target_storage_path = build_storage_path(*path_parts)
+        upload_file_to_storage(local_path_obj, parse_storage_relative_path(target_storage_path))
 
-        logger.info(f"文件已上传到对象存储: {local_path_obj} -> {target_minio_path}")
-        return target_minio_path
+        logger.info(f"文件已保存到本地工作区: {local_path_obj} -> {target_storage_path}")
+        return target_storage_path
     except Exception as e:
-        logger.error(f"上传对象存储路径时出错: {str(e)}")
+        logger.error(f"保存本地工作区路径时出错: {str(e)}")
         return str(local_path)
 
-def save_local_copy_async(minio_path, local_path):
+def save_local_copy_async(storage_path, local_path):
     def _save_copy():
         try:
-            if PathHandler.is_minio_path(minio_path):
-                source_path = Path(ensure_local_path(minio_path))
+            if PathHandler.is_legacy_remote_uri(storage_path):
+                source_path = Path(ensure_local_path(storage_path))
                 target_path = Path(local_path)
                 if source_path.resolve() == target_path.resolve():
                     return
@@ -1761,7 +1930,7 @@ def save_local_copy_async(minio_path, local_path):
     thread.daemon = True
     thread.start()
 
-class DatabaseManager(BaseDatabaseManager):
+class TrainerDatabaseManager(BaseDatabaseManager):
     """业务数据库管理器，继承连接池基类，包含业务查询方法"""
 
     def get_connection(self):
@@ -1770,15 +1939,16 @@ class DatabaseManager(BaseDatabaseManager):
             if self._engine:
                 connection = self._engine.raw_connection()
             else:
-                connection = pymysql.connect(**self.config)
+                connect_config = {**self.config, 'connect_timeout': 10}
+                connection = pymysql.connect(**connect_config)
             return connection
         except Exception as e:
             logger.error(f"数据库连接失败: {str(e)}")
             return None
 
     def _build_default_original_data_address(self, dataset_id):
-        """根据 dataset_id 构造默认的原始数据 MinIO 路径"""
-        return f"minio://algorithm/trainer/original_dataset/{dataset_id}/original_train_data"
+        """根据 dataset_id 构造默认的原始数据本地路径"""
+        return PathHandler.build_data_path('original_dataset', str(dataset_id), 'original_train_data')
 
     def _ensure_original_data_address(self, connection, cursor, dataset_id, original_data_address):
         """当 original_data_address 为空时，按约定路径自动补全并回写数据库"""
@@ -1786,17 +1956,18 @@ class DatabaseManager(BaseDatabaseManager):
             return original_data_address
 
         default_path = self._build_default_original_data_address(dataset_id)
+        default_path_for_db = normalize_storage_path_for_db(default_path)
 
         try:
             sql = "UPDATE train_dataset SET original_data_address = %s WHERE id = %s"
-            cursor.execute(sql, (default_path, dataset_id))
+            cursor.execute(sql, (default_path_for_db, dataset_id))
             connection.commit()
-            logger.info(f"original_data_address为空，已按dataset_id自动补全: dataset_id={dataset_id}, path={default_path}")
+            logger.info(f"original_data_address为空，已按dataset_id自动补全: dataset_id={dataset_id}, path={default_path_for_db}")
         except Exception as e:
             connection.rollback()
             logger.warning(f"回写默认original_data_address失败，将继续使用拼接路径: dataset_id={dataset_id}, error={str(e)}")
 
-        return default_path
+        return default_path_for_db
 
     def _build_split_addresses(self, original_data_address):
         """根据 original_train_data 根路径推导 train/valid 划分路径"""
@@ -1805,6 +1976,75 @@ class DatabaseManager(BaseDatabaseManager):
             'original_train_data_address': f"{base_path}/train",
             'original_val_data_address': f"{base_path}/valid"
         }
+
+    def get_dataset_original_hash(self, dataset_id):
+        """读取 train_dataset.original_dataset_hash 字段。
+
+        字段不存在(老库未迁移)或查询失败时返回 None,使调用方退化为正常流程。
+        """
+        info = self.get_dataset_original_hash_info(dataset_id)
+        return info.get('hash') if info else None
+
+    def get_dataset_original_hash_info(self, dataset_id):
+        """读取 original_dataset_hash 及其 schema 版本。"""
+        connection = self.get_connection()
+        if not connection:
+            return None
+
+        try:
+            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                try:
+                    sql = "SELECT original_dataset_hash, original_dataset_hash_schema FROM train_dataset WHERE id = %s"
+                    cursor.execute(sql, (dataset_id,))
+                except Exception as e:
+                    if 'original_dataset_hash_schema' not in str(e):
+                        raise
+                    connection.rollback()
+                    sql = "SELECT original_dataset_hash FROM train_dataset WHERE id = %s"
+                    cursor.execute(sql, (dataset_id,))
+                result = cursor.fetchone()
+                if not result:
+                    return None
+                return {
+                    'hash': result.get('original_dataset_hash'),
+                    'schema': result.get('original_dataset_hash_schema')
+                }
+        except Exception as e:
+            logger.warning(f"读取original_dataset_hash失败,跳过哈希校验: dataset_id={dataset_id}, error={str(e)}")
+            return None
+        finally:
+            connection.close()
+
+    def update_dataset_original_hash(self, dataset_id, dataset_hash, schema_version=ORIGINAL_DATASET_HASH_SCHEMA_VERSION):
+        """写入 train_dataset.original_dataset_hash 字段。"""
+        if not dataset_hash:
+            return False
+
+        connection = self.get_connection()
+        if not connection:
+            return False
+
+        try:
+            with connection.cursor() as cursor:
+                try:
+                    sql = """UPDATE train_dataset
+                             SET original_dataset_hash = %s,
+                                 original_dataset_hash_schema = %s
+                             WHERE id = %s"""
+                    cursor.execute(sql, (dataset_hash, schema_version, dataset_id))
+                except Exception as e:
+                    if 'original_dataset_hash_schema' not in str(e):
+                        raise
+                    connection.rollback()
+                    sql = "UPDATE train_dataset SET original_dataset_hash = %s WHERE id = %s"
+                    cursor.execute(sql, (dataset_hash, dataset_id))
+                connection.commit()
+                return True
+        except Exception as e:
+            logger.warning(f"更新original_dataset_hash失败: dataset_id={dataset_id}, error={str(e)}")
+            return False
+        finally:
+            connection.close()
     
     def get_train_task(self, task_id):
         connection = self.get_connection()
@@ -1827,10 +2067,10 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return None
-        
+
         try:
             with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                sql = "SELECT yaml_address FROM train_dataset WHERE id = %s"
+                sql = "SELECT yaml_address, draw_type, kpt_num, kpt_labels FROM train_dataset WHERE id = %s"
                 cursor.execute(sql, (dataset_id,))
                 result = cursor.fetchone()
                 return result
@@ -1844,10 +2084,12 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return None
-        
+
         try:
             with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                sql = "SELECT id, dataset_address, labels, label_num, yaml_address FROM train_dataset WHERE id = %s"
+                sql = """SELECT id, duty_type, original_data_address, dataset_address, labels,
+                                label_num, yaml_address, draw_type, kpt_num, kpt_labels
+                         FROM train_dataset WHERE id = %s"""
                 cursor.execute(sql, (dataset_id,))
                 result = cursor.fetchone()
                 return result
@@ -1861,13 +2103,13 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return None
-        
+
         try:
             with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                sql = "SELECT id, duty_type, original_data_address, labels FROM train_dataset WHERE id = %s"
+                sql = "SELECT id, duty_type, original_data_address, labels, kpt_num, kpt_labels, draw_type FROM train_dataset WHERE id = %s"
                 cursor.execute(sql, (dataset_id,))
                 result = cursor.fetchone()
-                
+
                 if not result:
                     return None
 
@@ -1884,7 +2126,10 @@ class DatabaseManager(BaseDatabaseManager):
                     'duty_type': result.get('duty_type'),
                     'original_train_data_address': split_addresses['original_train_data_address'],
                     'original_val_data_address': split_addresses['original_val_data_address'],
-                    'labels': result.get('labels')
+                    'labels': result.get('labels'),
+                    'kpt_num': result.get('kpt_num'),
+                    'kpt_labels': result.get('kpt_labels'),
+                    'draw_type': result.get('draw_type'),
                 }
         except Exception as e:
             logger.error(f"查询json2txt数据集信息失败: {str(e)}")
@@ -1896,11 +2141,11 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
                 sql = "UPDATE train_dataset SET yaml_address = %s WHERE id = %s"
-                cursor.execute(sql, (yaml_address, dataset_id))
+                cursor.execute(sql, (normalize_storage_path_for_db(yaml_address), dataset_id))
                 connection.commit()
                 return True
         except Exception as e:
@@ -1934,11 +2179,11 @@ class DatabaseManager(BaseDatabaseManager):
                 
                 if trained_bestmodel_address is not None:
                     update_fields.append("trained_bestmodel_address = %s")
-                    values.append(trained_bestmodel_address)
-                
+                    values.append(normalize_storage_path_for_db(trained_bestmodel_address))
+
                 if trained_lastmodel_address is not None:
                     update_fields.append("trained_lastmodel_address = %s")
-                    values.append(trained_lastmodel_address)
+                    values.append(normalize_storage_path_for_db(trained_lastmodel_address))
                 
                 values.append(task_id)
                 sql = f"UPDATE train_task SET {', '.join(update_fields)} WHERE id = %s"
@@ -1983,11 +2228,11 @@ class DatabaseManager(BaseDatabaseManager):
                 
                 if trained_bestmodel_address:
                     update_fields.append("trained_bestmodel_address = %s")
-                    values.append(trained_bestmodel_address)
-                
+                    values.append(normalize_storage_path_for_db(trained_bestmodel_address))
+
                 if trained_lastmodel_address:
                     update_fields.append("trained_lastmodel_address = %s")
-                    values.append(trained_lastmodel_address)
+                    values.append(normalize_storage_path_for_db(trained_lastmodel_address))
                 
                 values.append(task_id)
                 sql = f"UPDATE train_task SET {', '.join(update_fields)} WHERE id = %s"
@@ -2133,28 +2378,41 @@ class DatabaseManager(BaseDatabaseManager):
         finally:
             connection.close()
     
-    def update_dataset_detail(self, dataset_id, sample_num, annotation_num, labels, label_num, tag_num, draw_type=None, tag_sum=None, tag_percentage=None):
+    def update_dataset_detail(self, dataset_id, sample_num, annotation_num, labels, label_num,
+                              tag_num, draw_type=None, tag_sum=None, tag_percentage=None,
+                              kpt_num=None, kpt_labels=None):
         """更新数据集详情信息"""
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
+                # 动态拼接字段，避免在没有 draw_type/kpt_num 时也强写
+                fields = [
+                    "sample_num = %s", "annotation_num = %s", "labels = %s",
+                    "label_num = %s", "tag_num = %s",
+                    "tag_sum = %s", "tag_percentage = %s",
+                    "update_time = NOW()",
+                ]
+                values = [sample_num, annotation_num, labels, label_num, tag_num, tag_sum, tag_percentage]
+
                 if draw_type is not None:
-                    sql = """UPDATE train_dataset 
-                            SET sample_num = %s, annotation_num = %s, labels = %s, 
-                                label_num = %s, tag_num = %s, draw_type = %s, 
-                                tag_sum = %s, tag_percentage = %s, update_time = NOW()
-                            WHERE id = %s"""
-                    cursor.execute(sql, (sample_num, annotation_num, labels, label_num, tag_num, draw_type, tag_sum, tag_percentage, dataset_id))
-                else:
-                    sql = """UPDATE train_dataset 
-                            SET sample_num = %s, annotation_num = %s, labels = %s, 
-                                label_num = %s, tag_num = %s, 
-                                tag_sum = %s, tag_percentage = %s, update_time = NOW()
-                            WHERE id = %s"""
-                    cursor.execute(sql, (sample_num, annotation_num, labels, label_num, tag_num, tag_sum, tag_percentage, dataset_id))
+                    fields.insert(5, "draw_type = %s")
+                    values.insert(5, draw_type)
+
+                # kpt_num 仅在显式传入（包括 0）时才更新
+                if kpt_num is not None:
+                    fields.append("kpt_num = %s")
+                    values.append(int(kpt_num))
+
+                if kpt_labels is not None:
+                    fields.append("kpt_labels = %s")
+                    values.append(kpt_labels)
+
+                values.append(dataset_id)
+                sql = f"UPDATE train_dataset SET {', '.join(fields)} WHERE id = %s"
+                cursor.execute(sql, values)
                 connection.commit()
                 logger.info(f"更新数据集详情成功: dataset_id={dataset_id}")
                 return True
@@ -2214,11 +2472,11 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
                 sql = "UPDATE train_dataset SET dataset_address = %s WHERE id = %s"
-                cursor.execute(sql, (dataset_address, dataset_id))
+                cursor.execute(sql, (normalize_storage_path_for_db(dataset_address), dataset_id))
                 connection.commit()
                 logger.info(f"更新数据集dataset_address成功: dataset_id={dataset_id}, dataset_address={dataset_address}")
                 return True
@@ -2232,11 +2490,11 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
                 sql = "UPDATE train_dataset SET original_data_address = %s WHERE id = %s"
-                cursor.execute(sql, (original_data_address, dataset_id))
+                cursor.execute(sql, (normalize_storage_path_for_db(original_data_address), dataset_id))
                 connection.commit()
                 logger.info(f"更新数据集original_data_address成功: dataset_id={dataset_id}, original_data_address={original_data_address}")
                 return True
@@ -2265,22 +2523,88 @@ class DatabaseManager(BaseDatabaseManager):
         finally:
             connection.close()
 
-    def update_dataset_process_status(self, dataset_id, process_status):
+    def update_dataset_keypoint_config(self, dataset_id, kpt_labels, kpt_num=None):
+        """更新 pose 关键点标签顺序与数量。"""
         connection = self.get_connection()
         if not connection:
             return False
 
+        normalized_labels = sort_keypoint_labels(kpt_labels or [])
+        if kpt_num is None:
+            kpt_num = len(normalized_labels)
+
         try:
             with connection.cursor() as cursor:
-                sql = "UPDATE train_dataset SET process_status = %s, update_time = NOW() WHERE id = %s"
-                cursor.execute(sql, (process_status, dataset_id))
+                sql = """UPDATE train_dataset
+                         SET kpt_num = %s,
+                             kpt_labels = %s,
+                             update_time = NOW()
+                         WHERE id = %s"""
+                cursor.execute(
+                    sql,
+                    (int(kpt_num or 0), json.dumps(normalized_labels, ensure_ascii=False), dataset_id)
+                )
                 connection.commit()
                 logger.info(
-                    f"更新数据集process_status成功: dataset_id={dataset_id}, process_status={process_status}"
+                    f"更新数据集关键点配置成功: dataset_id={dataset_id}, "
+                    f"kpt_num={kpt_num}, kpt_labels={normalized_labels}"
                 )
                 return True
         except Exception as e:
-            logger.error(f"更新数据集process_status失败: {str(e)}")
+            logger.error(f"更新数据集关键点配置失败: dataset_id={dataset_id}, error={str(e)}")
+            return False
+        finally:
+            connection.close()
+
+    def update_dataset_process_status(self, dataset_id, process_status, error_message=None):
+        connection = self.get_connection()
+        if not connection:
+            return False
+
+        truncated_error = str(error_message)[:1024] if error_message is not None else None
+        update_sql_candidates = []
+
+        if truncated_error is None:
+            update_sql_candidates = [
+                ("UPDATE train_dataset SET process_status = %s, error_message = NULL, update_time = NOW() WHERE id = %s", (process_status, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, build_error = NULL, update_time = NOW() WHERE id = %s", (process_status, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, status_message = NULL, update_time = NOW() WHERE id = %s", (process_status, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, process_error = NULL, update_time = NOW() WHERE id = %s", (process_status, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, update_time = NOW() WHERE id = %s", (process_status, dataset_id)),
+            ]
+        else:
+            update_sql_candidates = [
+                ("UPDATE train_dataset SET process_status = %s, error_message = %s, update_time = NOW() WHERE id = %s", (process_status, truncated_error, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, build_error = %s, update_time = NOW() WHERE id = %s", (process_status, truncated_error, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, status_message = %s, update_time = NOW() WHERE id = %s", (process_status, truncated_error, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, process_error = %s, update_time = NOW() WHERE id = %s", (process_status, truncated_error, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, error = %s, update_time = NOW() WHERE id = %s", (process_status, truncated_error, dataset_id)),
+                ("UPDATE train_dataset SET process_status = %s, update_time = NOW() WHERE id = %s", (process_status, dataset_id)),
+            ]
+
+        last_error = None
+        try:
+            for sql, params in update_sql_candidates:
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(sql, params)
+                    connection.commit()
+                    if truncated_error is None:
+                        logger.info(
+                            f"更新数据集process_status成功: dataset_id={dataset_id}, process_status={process_status}"
+                        )
+                    else:
+                        logger.info(
+                            f"更新数据集process_status和错误信息成功: dataset_id={dataset_id}, process_status={process_status}, error_message={truncated_error}"
+                        )
+                    return True
+                except Exception as e:
+                    last_error = e
+                    connection.rollback()
+                    continue
+
+            if last_error:
+                logger.error(f"更新数据集process_status失败: {str(last_error)}")
             return False
         finally:
             connection.close()
@@ -2289,11 +2613,11 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
                 sql = "UPDATE train_task SET log_path = %s WHERE id = %s"
-                cursor.execute(sql, (log_path, task_id))
+                cursor.execute(sql, (normalize_storage_path_for_db(log_path), task_id))
                 connection.commit()
                 logger.info(f"更新任务日志路径成功: task_id={task_id}, log_path={log_path}")
                 return True
@@ -2307,11 +2631,11 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
                 sql = "UPDATE train_task SET chart_path = %s WHERE id = %s"
-                cursor.execute(sql, (chart_path, task_id))
+                cursor.execute(sql, (normalize_storage_path_for_db(chart_path), task_id))
                 connection.commit()
                 logger.info(f"更新任务图表路径成功: task_id={task_id}, chart_path={chart_path}")
                 return True
@@ -2399,13 +2723,13 @@ class DatabaseManager(BaseDatabaseManager):
         connection = self.get_connection()
         if not connection:
             return False
-        
+
         try:
             with connection.cursor() as cursor:
-                sql = """UPDATE trained_weights 
-                        SET predicted_result_address = %s 
+                sql = """UPDATE trained_weights
+                        SET predicted_result_address = %s
                         WHERE id = %s"""
-                cursor.execute(sql, (predicted_result_address, train_weights_id))
+                cursor.execute(sql, (normalize_storage_path_for_db(predicted_result_address), train_weights_id))
                 connection.commit()
                 logger.info(f"更新预测结果路径成功: weights_id={train_weights_id}, path={predicted_result_address}")
                 return True
@@ -2492,8 +2816,12 @@ class DatabaseManager(BaseDatabaseManager):
                         finished_at = NULL,
                         update_time = NOW()"""
                 cursor.execute(sql, (
-                    model_id, type_code, source_path, convert_format,
-                    MODEL_CONVERT_STATUS_RUNNING, task_id
+                    model_id,
+                    type_code,
+                    normalize_storage_path_for_db(source_path),
+                    convert_format,
+                    MODEL_CONVERT_STATUS_RUNNING,
+                    task_id
                 ))
 
                 # 防御性更新：确保旧失败记录被本次新任务明确置为“转换中”。
@@ -2540,8 +2868,15 @@ class DatabaseManager(BaseDatabaseManager):
                         finished_at = NOW(),
                         update_time = NOW()"""
                 cursor.execute(sql, (
-                    model_id, type_code, source_path, convert_path, convert_format, file_size_mb,
-                    MODEL_CONVERT_STATUS_SUCCESS, task_id, MODEL_CONVERT_STATUS_SUCCESS
+                    model_id,
+                    type_code,
+                    normalize_storage_path_for_db(source_path),
+                    normalize_storage_path_for_db(convert_path),
+                    convert_format,
+                    file_size_mb,
+                    MODEL_CONVERT_STATUS_SUCCESS,
+                    task_id,
+                    MODEL_CONVERT_STATUS_SUCCESS
                 ))
                 connection.commit()
                 logger.info(
@@ -2575,8 +2910,14 @@ class DatabaseManager(BaseDatabaseManager):
                         finished_at = NOW(),
                         update_time = NOW()"""
                 cursor.execute(sql, (
-                    model_id, type_code, source_path, convert_format,
-                    MODEL_CONVERT_STATUS_FAILED, task_id, truncated_error, MODEL_CONVERT_STATUS_FAILED
+                    model_id,
+                    type_code,
+                    normalize_storage_path_for_db(source_path),
+                    convert_format,
+                    MODEL_CONVERT_STATUS_FAILED,
+                    task_id,
+                    truncated_error,
+                    MODEL_CONVERT_STATUS_FAILED
                 ))
                 connection.commit()
                 logger.info(f"模型转换失败状态已写入: model_id={model_id}, type_code={type_code}")
@@ -2877,8 +3218,8 @@ class DatabaseManager(BaseDatabaseManager):
                     task_info.get('duty_type'),
                     labels_value,
                     task_info.get('dataset_id'),
-                    bestmodel_address,
-                    lastmodel_address,
+                    normalize_storage_path_for_db(bestmodel_address),
+                    normalize_storage_path_for_db(lastmodel_address),
                     file_size_mb,
                     task_info.get('status'),
                     recall,
@@ -3030,8 +3371,6 @@ class RedisManager:
         except Exception as e:
             logger.error(f"Redis获取任务状态失败: {str(e)}")
             return {}
-            logger.error(f"Redis获取任务状态失败: {str(e)}")
-            return {}
 
 
 def get_most_free_gpu():
@@ -3049,7 +3388,6 @@ def get_most_free_gpu():
         free_memory = []
         for i in range(gpu_count):
             try:
-                import subprocess
                 result = subprocess.run(
                     ['nvidia-smi', '--query-gpu=memory.free', '--format=csv,nounits,noheader', f'--id={i}'],
                     capture_output=True, text=True, timeout=5
@@ -3079,6 +3417,9 @@ def get_most_free_gpu():
     except Exception as e:
         logger.error(f"获取最空闲GPU失败: {e}，默认使用GPU 0")
         return '0'
+
+
+DatabaseManager = TrainerDatabaseManager  # 兼容旧测试/外部引用；实际业务类名使用 TrainerDatabaseManager。
 
 
 class TrainingManager:
@@ -3111,68 +3452,27 @@ class TrainingManager:
             return False, f"数据集构建失败，禁止启动训练: {error_msg}"
 
         if task_info and task_info.get('status') == 'processing':
-            return False, f"等待数据集构建超时（{max_wait_time}秒）"
+            error_msg = f"等待数据集构建超时（{max_wait_time}秒）"
+            task_info['status'] = 'failed'
+            task_info['error'] = error_msg
+            task_info['end_time'] = datetime.now()
+            return False, error_msg
 
         return True, None
     
     def build_command(self, task_params, task_id=None):
-        dataset_info = None
-        yaml_path = 'dataset.yaml'
-        
-        if task_params.get('dataset_id'):
-            dataset_info = self.db_manager.get_dataset_info(task_params.get('dataset_id'))
-            if dataset_info and dataset_info.get('yaml_address'):
-                yaml_path = ensure_local_path(dataset_info.get('yaml_address'))
-                logger.info(f"从数据库获取数据集配置: {dataset_info.get('yaml_address')} -> {yaml_path}")
-            else:
-                logger.warning(f"未找到dataset_id={task_params.get('dataset_id')}的数据集信息，使用默认配置")
-        
-        train_results_path = build_storage_local_path("train_results", require_exists=False)
-        train_results_path.mkdir(parents=True, exist_ok=True)
-        experiment_name = str(task_id) if task_id else str(task_params.get('id', 'exp'))
-        
-        cmd = [
-            sys.executable,
-            str(self.script_path),
-            "--dutyType", str(task_params.get('duty_type', 'detect')),  # 修复：数据库字段名是duty_type
-            "--model_type", str(task_params.get('model_type', 0)),
-            "--model_size", str(task_params.get('model_size', 'n')),
-            "--yaml", str(yaml_path),
-            "--batch", str(task_params.get('batch', 8)),
-            "--device", str(task_params.get('device', '0')),
-            "--imgsz", str(task_params.get('img_size', 640)),
-            "--epoch", str(task_params.get('epochs', 100)),
-            "--project", str(train_results_path),
-            "--name", experiment_name,
-            "--lr0", str(task_params.get('lr0', 0.0001)),
-            "--lrf", str(task_params.get('lrf', 0.001)),
-            "--cos_lr", str(task_params.get('cos_lr', True)),
-            "--warmup_epochs", str(task_params.get('warmup_epochs', 5)),
-            "--warmup_bias_lr", str(task_params.get('warmup_bias_lr', 0.1)),
-            "--momentum", str(task_params.get('momentum', 0.937)),
-            "--weight_decay", str(task_params.get('weight_decay', 0.0005)),
-            "--fliplr", str(task_params.get('fliplr', 0.5)),
-            "--amp", str(task_params.get('amp', False)),
-            "--patience", str(task_params.get('patience', 0)),
-            "--workers", str(task_params.get('workers', 8))
-        ]
-        
-        if task_params.get('model_type') == 1 and task_params.get('incremental_model_address'):
-            cmd.extend(["--incremental_model_address", str(task_params.get('incremental_model_address'))])
-        
-        if task_params.get('resume_path'):
-            cmd.extend(["--resume", str(task_params.get('resume_path'))])
-        
-        return cmd
+        """已废弃：训练不再通过 trainer.py CLI 子进程启动。"""
+        raise RuntimeError("build_command 已废弃；请使用 start_training_direct 的进程内训练入口")
     
     def build_training_params(self, task_params, dataset_info=None, task_id=None):
         try:
             yaml_path = 'dataset.yaml'
-            
+            kpt_num = 0
+
             logger.info(f"=== 构建训练参数调试 ===")
             logger.info(f"task_params.dataset_id: {task_params.get('dataset_id')}")
             logger.info(f"传入的dataset_info: {dataset_info}")
-            
+
             if dataset_info and dataset_info.get('yaml_address'):
                 yaml_path = ensure_local_path(dataset_info.get('yaml_address'))
                 logger.info(f"从传入的dataset_info获取数据集配置: {dataset_info.get('yaml_address')} -> {yaml_path}")
@@ -3186,19 +3486,25 @@ class TrainingManager:
                     logger.warning(f"数据库中yaml_address为空，使用默认值: {yaml_path}")
             else:
                 logger.warning(f"没有dataset_id，使用默认yaml路径: {yaml_path}")
-            
+
+            if dataset_info and dataset_info.get('kpt_num'):
+                try:
+                    kpt_num = int(dataset_info.get('kpt_num') or 0)
+                except (TypeError, ValueError):
+                    kpt_num = 0
+
             logger.info(f"最终yaml_path: {yaml_path}")
             logger.info(f"=== 构建训练参数调试结束 ===")
-            
+
             train_results_path = build_storage_local_path("train_results", require_exists=False)
             train_results_path.mkdir(parents=True, exist_ok=True)
             experiment_name = str(task_id) if task_id else str(task_params.get('id', 'exp'))
-        
+
             train_params = {
                 'dutyType': str(task_params.get('duty_type', 'detect')),
                 'model_type': int(task_params.get('model_type', 0)),
                 'model_size': str(task_params.get('model_size', 'n')),
-                'incremental_model_address': str(task_params.get('incremental_model_address', '')),
+                'incremental_model_address': str(resolve_storage_path_to_local(task_params.get('incremental_model_address')) or ''),
                 'batch': int(task_params.get('batch', 8)),
                 'device': str(task_params.get('device', '0')),
                 'imgsz': int(task_params.get('img_size', 640)),
@@ -3219,30 +3525,59 @@ class TrainingManager:
                 'patience': int(task_params.get('patience', 0)),
                 'save_period': int(task_params.get('save_period', -1)),
                 'workers': int(task_params.get('workers', 8)),
-                'resume': str(task_params.get('resume_path', ''))
+                'resume': str(task_params.get('resume_path', '')),
+                'kpt_num': kpt_num
             }
-            
+
             return train_params
-            
+
         except Exception as e:
             logger.error(f"构建训练参数失败: {str(e)}")
             return None
-    
+
+    def _release_training_reservation(self, task_id):
+        """释放尚未移交给训练线程的占位记录（仅释放 starting 状态的占位）"""
+        with _running_processes_lock:
+            info = running_processes.get(task_id)
+            if info and info.get('status') == 'starting':
+                running_processes.pop(task_id, None)
+
     def start_training_direct(self, task_id):
+        reservation_active = False
         try:
             task_params = self.db_manager.get_train_task(task_id)
             if not task_params:
                 logger.error(f"未找到训练任务: {task_id}")
                 return False, "未找到训练任务"
-            
+
             logger.info(f"从数据库获取的字段名: {list(task_params.keys())}")
             logger.info(f"duty_type字段值: {task_params.get('duty_type', 'NOT_FOUND')}")
             logger.info(f"dutyType字段值: {task_params.get('dutyType', 'NOT_FOUND')}")
-            
-            if task_id in running_processes:
-                logger.warning(f"训练任务 {task_id} 已在运行中")
-                return False, "训练任务已在运行中"
-            
+
+            # 单进程单训练：训练在本进程线程内执行，sys.stdout/stderr 与
+            # ultralytics logger 都是全局状态，并发训练会互相污染日志与输出，
+            # 任一任务结束又会恢复全局输出。因此原子地占位，确保同一时刻
+            # 只有一个训练任务在跑（日志通过 TrainingLogWriter 落盘 + /log 接口读取）。
+            with _running_processes_lock:
+                if task_id in running_processes:
+                    logger.warning(f"训练任务 {task_id} 已在运行中")
+                    return False, "训练任务已在运行中"
+                if running_processes:
+                    other_ids = list(running_processes.keys())
+                    logger.warning(
+                        f"已有训练任务在运行，拒绝并发训练: running={other_ids}, 新请求={task_id}"
+                    )
+                    return False, (
+                        f"已有训练任务在运行中（task_id={other_ids[0]}），"
+                        f"当前仅支持单进程单训练，请等待其完成后再试"
+                    )
+                running_processes[task_id] = {
+                    'status': 'starting',
+                    'type': 'direct',
+                    'start_time': datetime.now()
+                }
+            reservation_active = True
+
             db_device = task_params.get('device', '0')
             logger.info(f"数据库device字段值: {db_device}")
             
@@ -3264,12 +3599,16 @@ class TrainingManager:
                 ready, wait_message = self._wait_for_dataset_ready(task_params.get('dataset_id'))
                 if not ready:
                     logger.error(wait_message)
+                    self._release_training_reservation(task_id)
+                    reservation_active = False
                     return False, wait_message
                 dataset_info = self.db_manager.get_dataset_full_info(task_params.get('dataset_id'))
-            
+
             train_params = self.build_training_params(task_params, dataset_info, task_id)
             if not train_params:
                 logger.error("构建训练参数失败")
+                self._release_training_reservation(task_id)
+                reservation_active = False
                 return False, "构建训练参数失败"
             
             logger.info(f"启动训练任务 {task_id}")
@@ -3312,7 +3651,7 @@ class TrainingManager:
                     csv_monitor_thread.start()
                     logger.info(f"CSV监控线程已启动: {results_csv_path}, total_epochs={total_epochs}")
                     
-                    success = trainer.train(**train_params)
+                    train_result = trainer.train(**train_params)
                     end_time = datetime.now()
                     
                     csv_monitor_stop_event.set()
@@ -3321,11 +3660,20 @@ class TrainingManager:
                     
                     self._sync_csv_to_db(task_id, results_csv_path)
                     
-                    if success:
-                        best_model_minio_path = None
-                        last_model_minio_path = None
-                        chart_minio_path = None
-                        log_minio_path = None
+                    if train_result == 'stopped' or (
+                        getattr(trainer, 'training_stopped', False)
+                        and getattr(trainer, 'stop_event', None)
+                        and trainer.stop_event.is_set()
+                    ):
+                        self.db_manager.update_task_completion(task_id, end_time, 'stopped')
+                        if self.redis_manager:
+                            self.redis_manager.sync_task_status(task_id, 'stopped')
+                        logger.info(f"训练任务 {task_id} 已停止，结束时间: {end_time}")
+                    elif train_result:
+                        best_model_storage_path = None
+                        last_model_storage_path = None
+                        chart_storage_path = None
+                        log_storage_path = None
                         
                         try:
                             local_best_path = None
@@ -3355,10 +3703,10 @@ class TrainingManager:
                                             local_last_path = str(last_model.resolve())
                             
                             if local_best_path and Path(local_best_path).exists():
-                                best_model_minio_path = upload_to_minio_and_get_path(local_best_path, 'train_results', task_id)
-                            
+                                best_model_storage_path = local_best_path
+
                             if local_last_path and Path(local_last_path).exists():
-                                last_model_minio_path = upload_to_minio_and_get_path(local_last_path, 'train_results', task_id)
+                                last_model_storage_path = local_last_path
                                 
                         except Exception as me:
                             logger.warning(f"获取模型路径失败: {str(me)}")
@@ -3369,35 +3717,35 @@ class TrainingManager:
                             results_csv = chart_results_path / experiment_name / 'results.csv'
                             
                             if results_csv.exists():
-                                chart_minio_path = upload_to_minio_and_get_path(results_csv, 'train_results', task_id)
-                                self.db_manager.update_task_chart_path(task_id, chart_minio_path)
-                                logger.info(f"图表MinIO路径已保存: {chart_minio_path}")
+                                chart_storage_path = copy_to_storage_and_get_path(results_csv, 'train_results', task_id)
+                                self.db_manager.update_task_chart_path(task_id, chart_storage_path)
+                                logger.info(f"图表存储路径已保存: {chart_storage_path}")
                             else:
                                 logger.warning(f"图表文件不存在: {results_csv}")
                         except Exception as ce:
                             logger.warning(f"处理图表路径失败: {str(ce)}")
                         
                         try:
-                            if hasattr(trainer, 'get_log_minio_path'):
-                                log_minio_path = trainer.get_log_minio_path()
-                                if log_minio_path:
-                                    self.db_manager.update_task_log_path(task_id, log_minio_path)
-                                    logger.info(f"日志MinIO路径已保存（从trainer获取）: {log_minio_path}")
+                            if hasattr(trainer, 'get_log_path'):
+                                log_storage_path = trainer.get_log_path()
+                                if log_storage_path:
+                                    self.db_manager.update_task_log_path(task_id, log_storage_path)
+                                    logger.info(f"日志存储路径已保存（从trainer获取）: {log_storage_path}")
                                 else:
-                                    logger.warning(f"trainer未返回日志MinIO路径")
+                                    logger.warning(f"trainer未返回日志存储路径")
                             elif log_file_path.exists():
-                                log_minio_path = upload_to_minio_and_get_path(log_file_path, 'train_log', task_id)
-                                self.db_manager.update_task_log_path(task_id, log_minio_path)
-                                logger.info(f"日志MinIO路径已保存（从本地上传）: {log_minio_path}")
+                                log_storage_path = copy_to_storage_and_get_path(log_file_path, 'train_log', task_id)
+                                self.db_manager.update_task_log_path(task_id, log_storage_path)
+                                logger.info(f"日志存储路径已保存（从本地上传）: {log_storage_path}")
                             else:
-                                logger.warning(f"日志文件不存在且trainer未提供MinIO路径: {log_file_path}")
+                                logger.warning(f"日志文件不存在且 trainer 未提供存储路径: {log_file_path}")
                         except Exception as le:
                             logger.warning(f"处理日志路径失败: {str(le)}")
                         
                         self.db_manager.update_task_completion(
                             task_id, end_time, 'completed', 
-                            trained_bestmodel_address=best_model_minio_path,
-                            trained_lastmodel_address=last_model_minio_path
+                            trained_bestmodel_address=best_model_storage_path,
+                            trained_lastmodel_address=last_model_storage_path
                         )
                         if self.redis_manager:
                             self.redis_manager.sync_task_status(task_id, 'completed')
@@ -3421,8 +3769,8 @@ class TrainingManager:
                         try:
                             weights_id = self.db_manager.insert_train_weights(
                                 train_task_id=task_id,
-                                bestmodel_address=best_model_minio_path,
-                                lastmodel_address=last_model_minio_path,
+                                bestmodel_address=best_model_storage_path,
+                                lastmodel_address=last_model_storage_path,
                                 precision=final_metrics.get('precision') if final_metrics else None,
                                 recall=final_metrics.get('recall') if final_metrics else None,
                                 accuracy=final_metrics.get('accuracy') if final_metrics else None
@@ -3435,14 +3783,14 @@ class TrainingManager:
                             logger.warning(f"插入train_weights失败: {str(we)}")
                         
                         logger.info(f"训练任务 {task_id} 完成，结束时间: {end_time}")
-                        if best_model_minio_path:
-                            logger.info(f"Best模型MinIO路径: {best_model_minio_path}")
-                        if last_model_minio_path:
-                            logger.info(f"Last模型MinIO路径: {last_model_minio_path}")
-                        if chart_minio_path:
-                            logger.info(f"Chart MinIO路径: {chart_minio_path}")
-                        if log_minio_path:
-                            logger.info(f"Log MinIO路径: {log_minio_path}")
+                        if best_model_storage_path:
+                            logger.info(f"Best 模型存储路径: {best_model_storage_path}")
+                        if last_model_storage_path:
+                            logger.info(f"Last 模型存储路径: {last_model_storage_path}")
+                        if chart_storage_path:
+                            logger.info(f"Chart 存储路径: {chart_storage_path}")
+                        if log_storage_path:
+                            logger.info(f"Log 存储路径: {log_storage_path}")
                     else:
                         self.db_manager.update_task_completion(task_id, end_time, 'failed')
                         if self.redis_manager:
@@ -3465,8 +3813,9 @@ class TrainingManager:
                             del running_processes[task_id]
 
             thread = threading.Thread(target=training_thread, daemon=True)
-            thread.start()
 
+            # 先用完整记录覆盖占位（含未启动的线程对象），再启动线程：
+            # 避免线程极快结束后其 finally 删除条目、随后再注册产生残留脏记录。
             with _running_processes_lock:
                 running_processes[task_id] = {
                     'thread': thread,
@@ -3475,165 +3824,68 @@ class TrainingManager:
                     'task_params': task_params,
                     'type': 'direct'
                 }
-            
+            # 所有权移交训练线程的 finally 清理，外层不再负责释放占位
+            reservation_active = False
+
+            try:
+                thread.start()
+            except Exception:
+                with _running_processes_lock:
+                    running_processes.pop(task_id, None)
+                raise
+
             logger.info(f"训练任务 {task_id} 启动成功")
             return True, f"训练任务启动成功"
-            
+
         except Exception as e:
             logger.error(f"启动训练任务失败: {str(e)}")
             return False, f"启动训练任务失败: {str(e)}"
+        finally:
+            # 任何未移交所有权的提前返回/异常路径，释放占位避免训练永久被锁
+            if reservation_active:
+                self._release_training_reservation(task_id)
     
     def start_training(self, task_id):
-        try:
-            task_params = self.db_manager.get_train_task(task_id)
-            if not task_params:
-                logger.error(f"未找到训练任务: {task_id}")
-                return False, "未找到训练任务"
-            
-            with _running_processes_lock:
-                if task_id in running_processes:
-                    logger.warning(f"训练任务 {task_id} 已在运行中")
-                    return False, "训练任务已在运行中"
-
-            self.db_manager.update_task_status(task_id, 'not_started')
-
-            cmd = self.build_command(task_params, task_id)
-            logger.info(f"启动训练命令: {' '.join(cmd)}")
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,
-                cwd=Path(__file__).parent
-            )
-
-            start_time = datetime.now()
-            with _running_processes_lock:
-                running_processes[task_id] = {
-                    'process': process,
-                    'pid': process.pid,
-                    'start_time': start_time,
-                    'cmd': cmd,
-                    'type': 'subprocess'
-                }
-            
-            self.db_manager.update_task_status(task_id, 'running', process_id=process.pid, start_time=start_time)
-            if self.redis_manager:
-                task_info_for_redis = self.db_manager.get_task_for_redis(task_id)
-                self.redis_manager.sync_task_status(task_id, 'running', task_info_for_redis)
-            
-            monitor_thread = threading.Thread(
-                target=self._monitor_process,
-                args=(task_id, process),
-                daemon=True
-            )
-            monitor_thread.start()
-            
-            logger.info(f"训练任务 {task_id} 启动成功，PID: {process.pid}，开始时间: {start_time}")
-            return True, f"训练任务启动成功，PID: {process.pid}"
-            
-        except Exception as e:
-            logger.error(f"启动训练任务失败: {str(e)}")
-            return False, f"启动训练任务失败: {str(e)}"
+        """兼容旧调用路径：统一走进程内训练线程。"""
+        logger.warning("start_training 子进程入口已废弃，自动切换到 start_training_direct")
+        return self.start_training_direct(task_id)
     
     def stop_training(self, task_id):
         try:
-            logger.info(f"收到强制停止训练请求: task_id={task_id}")
+            logger.info(f"收到停止训练请求: task_id={task_id}")
 
-            found_in_memory = False
             with _running_processes_lock:
-                if task_id in running_processes:
-                    found_in_memory = True
-                    process_info = running_processes[task_id]
+                process_info = running_processes.get(task_id)
+                if not process_info:
+                    logger.warning(f"任务 {task_id} 不在当前进程运行记录中")
+                    return False, "训练任务未在当前进程中运行"
 
-                    if 'process' in process_info:
-                        process = process_info['process']
-                        try:
-                            logger.info(f"强制终止进程组 {process.pid} (SIGKILL)")
-                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                            process.wait()
-                            logger.info(f"进程组 {process.pid} 已被强制终止")
-                        except ProcessLookupError:
-                            logger.info(f"进程 {process.pid} 已经结束")
-                        except Exception as e:
-                            logger.warning(f"终止进程时出错: {e}")
+                if 'thread' in process_info:
+                    trainer = process_info.get('trainer')
+                    if not trainer:
+                        return False, "训练任务缺少 trainer 实例，无法发送停止信号"
 
-                    elif 'thread' in process_info:
-                        if 'trainer' in process_info:
-                            trainer = process_info['trainer']
-                            try:
-                                trainer.stop_training()
-                                logger.info(f"已设置停止标志: {task_id}")
+                    trainer.stop_training()
+                    if hasattr(trainer, 'stop_event'):
+                        trainer.stop_event.set()
+                    trainer.training_stopped = True
 
-                                if hasattr(trainer, 'model_trainer') and trainer.model_trainer:
-                                    trainer.model_trainer.stop = True
-                                    if hasattr(trainer.model_trainer, 'stop_training'):
-                                        trainer.model_trainer.stop_training = True
-                                    if hasattr(trainer.model_trainer, 'epoch'):
-                                        trainer.model_trainer.epoch = trainer.model_trainer.epochs
-                                    logger.info(f"已强制设置YOLO trainer停止标志: {task_id}")
+                    if hasattr(trainer, 'model_trainer') and trainer.model_trainer:
+                        trainer.model_trainer.stop = True
+                        if hasattr(trainer.model_trainer, 'stop_training'):
+                            trainer.model_trainer.stop_training = True
+                        logger.info(f"已设置 YOLO trainer 停止标志: {task_id}")
 
-                                trainer.stop_event.set()
-                                trainer.training_stopped = True
+                    process_info['status'] = 'stopping'
+                    process_info['stop_requested_at'] = datetime.now()
+                    logger.info(f"已发送协作式停止信号: task_id={task_id}")
+                    return True, "已发送停止信号，训练线程将协作式停止"
 
-                                thread = process_info.get('thread')
-                                if thread and thread.is_alive():
-                                    import ctypes
-                                    thread_id = thread.ident
-                                    if thread_id:
-                                        logger.info(f"尝试强制终止线程 {thread_id}")
-                                        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                                            ctypes.c_ulong(thread_id),
-                                            ctypes.py_object(SystemExit)
-                                        )
-                                        if res == 0:
-                                            logger.warning(f"线程 {thread_id} 不存在")
-                                        elif res > 1:
-                                            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), None)
-                                            logger.error(f"强制终止线程失败")
-                                        else:
-                                            logger.info(f"已向线程 {thread_id} 发送SystemExit信号")
-                            except Exception as te:
-                                logger.error(f"停止trainer失败: {te}")
+                if 'process' in process_info:
+                    logger.error("检测到已废弃的子进程训练记录，无法通过协作式停止处理")
+                    return False, "当前任务来自已废弃的子进程训练入口，无法协作式停止"
 
-                    del running_processes[task_id]
-
-            if not found_in_memory:
-                logger.info(f"任务 {task_id} 不在内存中，尝试从数据库获取进程信息")
-                task_info = self.db_manager.get_train_task(task_id)
-
-                if task_info and task_info.get('task_id'):
-                    stored_pid = task_info.get('task_id')
-                    current_pid = os.getpid()
-                    logger.info(f"从数据库获取到进程PID: {stored_pid}, 当前进程PID: {current_pid}")
-
-                    if stored_pid == current_pid:
-                        logger.warning(f"任务 {task_id} 运行在当前进程的线程中，无法通过kill强制终止")
-                        logger.info(f"请重启服务以终止该训练任务")
-                    else:
-                        try:
-                            os.kill(stored_pid, 0)
-                            logger.info(f"强制终止进程 {stored_pid} (SIGKILL)")
-                            os.kill(stored_pid, signal.SIGKILL)
-                            logger.info(f"进程 {stored_pid} 已被强制终止")
-                        except ProcessLookupError:
-                            logger.info(f"进程 {stored_pid} 已经结束")
-                        except PermissionError:
-                            logger.error(f"没有权限终止进程 {stored_pid}")
-                            return False, f"没有权限终止进程 {stored_pid}"
-                        except Exception as e:
-                            logger.warning(f"终止进程时出错: {e}")
-                else:
-                    logger.warning(f"数据库中未找到任务 {task_id} 的进程信息")
-
-            end_time = datetime.now()
-            self.db_manager.update_task_completion(task_id, end_time, 'stopped')
-            if self.redis_manager:
-                self.redis_manager.sync_task_status(task_id, 'stopped')
-
-            logger.info(f"训练任务 {task_id} 已强制停止，结束时间: {end_time}")
-            return True, "训练任务已强制停止"
+                return False, "训练任务运行记录格式不正确"
 
         except Exception as e:
             logger.error(f"停止训练任务失败: {str(e)}")
@@ -3765,90 +4017,10 @@ class TrainingManager:
             return None
     
     def _monitor_process(self, task_id, process):
-        """监控训练进程"""
-        try:
-            return_code = process.wait()
-            end_time = datetime.now()
+        """已废弃：训练不再通过 trainer.py CLI 子进程启动。"""
+        raise RuntimeError("_monitor_process 已废弃；训练状态由进程内训练线程收敛")
 
-            with _running_processes_lock:
-                if task_id in running_processes:
-                    del running_processes[task_id]
-            
-            if return_code == 0:
-                best_model_path = None
-                last_model_path = None
-                try:
-                    train_results_path = build_storage_local_path("train_results", require_exists=False)
-                    experiment_name = str(task_id)
-                    model_dir = train_results_path / experiment_name / 'weights'
-                    
-                    if model_dir.exists():
-                        best_model = model_dir / 'best.pt'
-                        last_model = model_dir / 'last.pt'
-                        
-                        if best_model.exists():
-                            best_model_path = upload_to_minio_and_get_path(str(best_model.resolve()), 'train_results', task_id)
-                            
-                        if last_model.exists():
-                            last_model_path = upload_to_minio_and_get_path(str(last_model.resolve()), 'train_results', task_id)
-                            
-                except Exception as me:
-                    logger.warning(f"获取模型路径失败: {str(me)}")
-                
-                self.db_manager.update_task_completion(
-                    task_id, end_time, 'completed',
-                    trained_bestmodel_address=best_model_path,
-                    trained_lastmodel_address=last_model_path
-                )
-                if self.redis_manager:
-                    self.redis_manager.sync_task_status(task_id, 'completed')
-                
-                try:
-                    results_csv_path = train_results_path / str(task_id) / 'results.csv'
-                    final_metrics = self._get_final_metrics_from_csv(results_csv_path)
-                    
-                    if final_metrics:
-                        self.db_manager.update_task_metrics(
-                            task_id,
-                            precision=final_metrics.get('precision'),
-                            recall=final_metrics.get('recall'),
-                            accuracy=final_metrics.get('accuracy')
-                        )
-                    
-                    weights_id = self.db_manager.insert_train_weights(
-                        train_task_id=task_id,
-                        bestmodel_address=best_model_path,
-                        lastmodel_address=last_model_path,
-                        precision=final_metrics.get('precision') if final_metrics else None,
-                        recall=final_metrics.get('recall') if final_metrics else None,
-                        accuracy=final_metrics.get('accuracy') if final_metrics else None
-                    )
-                    if weights_id:
-                        logger.info(f"训练权重记录已创建: weights_id={weights_id}, train_task_id={task_id}")
-                    else:
-                        logger.warning(f"创建训练权重记录失败: train_task_id={task_id}")
-                except Exception as we:
-                    logger.warning(f"处理训练指标或插入train_weights失败: {str(we)}")
-                
-                logger.info(f"训练任务 {task_id} 正常完成，结束时间: {end_time}")
-                if best_model_path:
-                    logger.info(f"Best模型路径: {best_model_path}")
-                if last_model_path:
-                    logger.info(f"Last模型路径: {last_model_path}")
-            else:
-                self.db_manager.update_task_completion(task_id, end_time, 'failed')
-                if self.redis_manager:
-                    self.redis_manager.sync_task_status(task_id, 'failed')
-                logger.error(f"训练任务 {task_id} 异常结束，返回码: {return_code}，结束时间: {end_time}")
-                
-        except Exception as e:
-            end_time = datetime.now()
-            self.db_manager.update_task_completion(task_id, end_time, 'failed')
-            if self.redis_manager:
-                self.redis_manager.sync_task_status(task_id, 'failed')
-            logger.error(f"监控进程异常: {str(e)}，结束时间: {end_time}")
-
-db_manager = DatabaseManager(DB_CONFIG)
+db_manager = TrainerDatabaseManager(DB_CONFIG)
 
 redis_config = trainer_config.get_redis_config()
 redis_manager = RedisManager(redis_config)
@@ -3876,15 +4048,16 @@ def convert_trained_model():
     """将训练完成的PT模型转换为目标平台模型"""
     try:
         data = request.get_json(silent=True) or {}
+        logger.info(f"[模型转换] 收到转换请求: remote_addr={request.remote_addr}, body={data}")
         model_id = data.get('model_id')
         target_platform = str(data.get('target_platform') or '').strip().lower()
 
         if model_id is None:
             return jsonify({"code": 1, "data": {"message": "缺少必需参数 model_id"}}), 400
         try:
-            model_id = int(model_id)
-        except (TypeError, ValueError):
-            return jsonify({"code": 1, "data": {"message": "model_id必须是整数"}}), 400
+            model_id = validate_positive_id(model_id, "model_id")
+        except ValidationError as e:
+            return jsonify({"code": 1, "data": {"message": str(e)}}), 400
         if not target_platform:
             return jsonify({"code": 1, "data": {"message": "缺少必需参数 target_platform"}}), 400
         if target_platform not in MODEL_CONVERT_SUPPORTED_PLATFORMS:
@@ -3916,6 +4089,31 @@ def convert_trained_model():
             return jsonify({"code": 1, "data": {"message": f"model_id={model_id}缺少bestmodel_address"}}), 400
 
         task_id = f"convert_{model_id}_{target_platform}_{int(time.time())}"
+        convert_key = (model_id, target_platform)
+        with _model_convert_tasks_lock:
+            existing_task = model_convert_tasks.get(convert_key)
+            if existing_task and existing_task.get('status') == 'processing':
+                logger.warning(
+                    f"[模型转换] 重复转换请求已忽略: model_id={model_id}, "
+                    f"target_platform={target_platform}, running_task_id={existing_task.get('task_id')}"
+                )
+                return jsonify({
+                    "code": 0,
+                    "data": {
+                        "message": "模型转换任务已在进行中",
+                        "model_id": model_id,
+                        "target_platform": target_platform,
+                        "convert_format": convert_format,
+                        "status": MODEL_CONVERT_STATUS_RUNNING,
+                        "task_id": existing_task.get('task_id')
+                    }
+                })
+            model_convert_tasks[convert_key] = {
+                'status': 'processing',
+                'task_id': task_id,
+                'start_time': datetime.now()
+            }
+
         if not db_manager.upsert_model_convert_processing(
             model_id=model_id,
             type_code=target_platform,
@@ -3923,9 +4121,12 @@ def convert_trained_model():
             convert_format=convert_format,
             task_id=task_id
         ):
+            with _model_convert_tasks_lock:
+                model_convert_tasks.pop(convert_key, None)
             return jsonify({"code": 1, "data": {"message": "写入模型转换初始状态失败"}}), 500
 
         def async_convert():
+            convert_status = 'failed'
             try:
                 raw_model_name = (
                     weight_info.get('model_name') or
@@ -3983,14 +4184,14 @@ def convert_trained_model():
                     raise NotImplementedError(f"{target_platform}模型转换暂未实现")
 
                 convert_path = normalize_address_for_db(str(converted_model_path.resolve()))
-                if PathHandler.is_minio_path(convert_path):
+                if PathHandler.is_legacy_remote_uri(convert_path):
                     upload_file_to_storage(
                         converted_model_path,
-                        parse_storage_object_path(convert_path),
+                        parse_storage_relative_path(convert_path),
                         content_type='application/octet-stream'
                     )
                     verify_storage_object_matches_file(converted_model_path, convert_path)
-                    logger.info(f"[模型转换] {convert_format}已上传到对象存储: {convert_path}")
+                    logger.info(f"[模型转换] {convert_format}已保存到本地工作区: {convert_path}")
                 file_size_mb = round(converted_model_path.stat().st_size / (1024 * 1024), 2)
 
                 if not db_manager.update_model_convert_success(
@@ -4008,11 +4209,11 @@ def convert_trained_model():
                     f"[模型转换] {target_platform}转换完成: model_id={model_id}, convert_path={convert_path}, "
                     f"file_size={file_size_mb}MB"
                 )
+                convert_status = 'completed'
 
             except Exception as e:
                 error_message = str(e)
                 logger.error(f"[模型转换] {target_platform}转换失败: model_id={model_id}, error={error_message}")
-                import traceback
                 logger.error(traceback.format_exc())
                 db_manager.update_model_convert_failure(
                     model_id=model_id,
@@ -4021,6 +4222,13 @@ def convert_trained_model():
                     error_message=error_message,
                     convert_format=convert_format,
                     task_id=task_id
+                )
+            finally:
+                with _model_convert_tasks_lock:
+                    model_convert_tasks.pop(convert_key, None)
+                logger.info(
+                    f"[模型转换] 转换任务锁已释放: model_id={model_id}, "
+                    f"target_platform={target_platform}, task_id={task_id}, status={convert_status}"
                 )
 
         thread = threading.Thread(target=async_convert, daemon=True)
@@ -4130,6 +4338,8 @@ def generate_dataset_yaml():
         dataset_address = dataset_info.get('dataset_address')
         labels = dataset_info.get('labels')
         label_num = dataset_info.get('label_num')
+        duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+        draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
         
         if not dataset_address or not labels or not label_num:
             return jsonify({"code": 1, "data": {"message": "数据集信息不完整，缺少dataset_address、labels或label_num"}}), 400
@@ -4144,35 +4354,48 @@ def generate_dataset_yaml():
         
         generator = DatasetYamlGenerator()
         yaml_output_path = Path(local_dataset_address) / "dataset.yaml"
+        duty_type_for_yaml = 'pose' if duty_type == 'pose' or draw_type == 'point' else None
+        kpt_labels = None
+        kpt_num = None
+        if duty_type_for_yaml == 'pose':
+            try:
+                kpt_labels, kpt_num = resolve_pose_keypoint_config(dataset_id, dataset_info, persist=True)
+            except ValueError as e:
+                return jsonify({"code": 1, "data": {"message": str(e)}}), 400
+
         result = generator.generate_silent(
             dataset_address=local_dataset_address,
             labels=labels,
             label_num=label_num,
-            output_path=str(yaml_output_path)
+            output_path=str(yaml_output_path),
+            duty_type=duty_type_for_yaml,
+            kpt_num=kpt_num
         )
         
         if result['success']:
             local_yaml_path = result['yaml_path']
             logger.info(f"YAML文件生成成功: {local_yaml_path}")
             
-            minio_yaml_path = normalize_address_for_db(local_yaml_path)
-            if PathHandler.is_minio_path(minio_yaml_path):
+            yaml_storage_path = normalize_address_for_db(local_yaml_path)
+            if PathHandler.is_legacy_remote_uri(yaml_storage_path):
                 upload_file_to_storage(
                     Path(local_yaml_path),
-                    parse_storage_object_path(minio_yaml_path),
+                    parse_storage_relative_path(yaml_storage_path),
                     content_type='application/x-yaml'
                 )
-                logger.info(f"YAML文件已上传到对象存储: {minio_yaml_path}")
+                logger.info(f"YAML文件已保存到本地工作区: {yaml_storage_path}")
 
-            if db_manager.update_dataset_yaml_address(dataset_id, minio_yaml_path):
-                logger.info(f"数据库yaml_address字段更新成功: {minio_yaml_path}")
+            if db_manager.update_dataset_yaml_address(dataset_id, yaml_storage_path):
+                logger.info(f"数据库yaml_address字段更新成功: {yaml_storage_path}")
                 return jsonify({
                     "code": 0, 
                     "data": {
                         "message": "YAML文件生成成功",
                         "dataset_id": dataset_id,
-                        "yaml_path": minio_yaml_path,
-                        "local_yaml_path": local_yaml_path
+                        "yaml_path": yaml_storage_path,
+                        "local_yaml_path": local_yaml_path,
+                        "kpt_labels": kpt_labels,
+                        "kpt_num": kpt_num
                     }
                 })
             else:
@@ -4182,7 +4405,7 @@ def generate_dataset_yaml():
                     "data": {
                         "message": "YAML文件生成成功，但数据库更新失败",
                         "dataset_id": dataset_id,
-                        "yaml_path": minio_yaml_path
+                        "yaml_path": yaml_storage_path
                     }
                 })
         else:
@@ -4217,7 +4440,7 @@ def convert_dataset_json2txt():
         if not dataset_info:
             return jsonify({"code": 1, "data": {"message": f"未找到dataset_id={dataset_id}的数据集信息"}}), 404
         
-        duty_type = dataset_info.get('duty_type')
+        duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
         original_train_data_address = dataset_info.get('original_train_data_address')
         original_val_data_address = dataset_info.get('original_val_data_address')
         labels_str = dataset_info.get('labels')
@@ -4243,6 +4466,20 @@ def convert_dataset_json2txt():
         except Exception as e:
             logger.error(f"解析标签失败: {str(e)}")
             return jsonify({"code": 1, "data": {"message": f"解析标签失败: {str(e)}"}}), 500
+
+        kpt_labels = None
+        kpt_num = None
+        if str(duty_type).strip().lower() == 'pose':
+            try:
+                kpt_labels, kpt_num = resolve_pose_keypoint_config(
+                    dataset_id,
+                    dataset_info,
+                    split_addresses=[original_train_data_address, original_val_data_address],
+                    persist=True,
+                )
+                logger.info(f"同步JSON转TXT pose 关键点配置: kpt_labels={kpt_labels}, kpt_num={kpt_num}")
+            except ValueError as e:
+                return jsonify({"code": 1, "data": {"message": str(e)}}), 400
         
         train_result = None
         val_result = None
@@ -4261,7 +4498,9 @@ def convert_dataset_json2txt():
                 train_converter = UnifiedJsonConverter(
                     duty_type=duty_type,
                     original_train_data_address=local_train_address,
-                    predefined_labels=labels_list
+                    predefined_labels=labels_list,
+                    kpt_labels=kpt_labels,
+                    kpt_num=kpt_num,
                 )
                 train_result = train_converter.convert()
                 train_labels_dir = train_converter.labels_dir
@@ -4287,7 +4526,9 @@ def convert_dataset_json2txt():
                 val_converter = UnifiedJsonConverter(
                     duty_type=duty_type,
                     original_train_data_address=local_val_address,
-                    predefined_labels=labels_list
+                    predefined_labels=labels_list,
+                    kpt_labels=kpt_labels,
+                    kpt_num=kpt_num,
                 )
                 val_result = val_converter.convert()
                 val_labels_dir = val_converter.labels_dir
@@ -4309,7 +4550,9 @@ def convert_dataset_json2txt():
                 "train_stats": train_result,
                 "val_stats": val_result,
                 "train_labels_dir": str(train_labels_dir) if train_labels_dir else None,
-                "val_labels_dir": str(val_labels_dir) if val_labels_dir else None
+                "val_labels_dir": str(val_labels_dir) if val_labels_dir else None,
+                "kpt_labels": kpt_labels,
+                "kpt_num": kpt_num
             }
         })
         
@@ -4317,10 +4560,87 @@ def convert_dataset_json2txt():
         return handle_api_exception(e, "JSON转TXT")
 
 
-def _upload_labels_to_minio(labels_dir, minio_source_path):
-    """把 json2txt 生成的 labels 上传回原始 split 对象前缀"""
+def _copy_labels_to_storage(labels_dir, source_storage_path):
+    """把 json2txt 生成的 labels 写回原始 split 本地目录"""
     local_dataset_dir = Path(labels_dir).parent
-    upload_converted_labels(local_dataset_dir, minio_source_path)
+    upload_converted_labels(local_dataset_dir, source_storage_path)
+
+
+def parse_json_array_field(value):
+    """解析数据库中保存的 JSON 数组字段。"""
+    if value is None:
+        return []
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='ignore')
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        value_str = str(value).strip()
+        if not value_str:
+            return []
+        try:
+            raw_items = json.loads(value_str)
+        except json.JSONDecodeError:
+            raw_items = [item.strip().strip('"\'') for item in value_str.strip('[]').split(',')]
+
+    if not isinstance(raw_items, list):
+        return []
+    return [str(item).strip() for item in raw_items if str(item).strip()]
+
+
+def parse_bool_param(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def resolve_pose_keypoint_config(dataset_id, dataset_info, split_addresses=None, persist=True):
+    """解析 pose 的关键点顺序和数量，优先使用 DB kpt_labels，不完整时从 JSON 重新扫描。"""
+    duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+    draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
+    if duty_type != 'pose' and draw_type != 'point':
+        return None, None
+
+    db_kpt_labels = sort_keypoint_labels(parse_json_array_field(dataset_info.get('kpt_labels')))
+    db_kpt_num_raw = dataset_info.get('kpt_num')
+    try:
+        db_kpt_num = int(db_kpt_num_raw or 0)
+    except (TypeError, ValueError):
+        db_kpt_num = 0
+
+    kpt_labels = db_kpt_labels
+    if not split_addresses:
+        original_data_address = dataset_info.get('original_data_address')
+        if original_data_address:
+            base_path = str(original_data_address).rstrip('/').rsplit('/', 1)[0]
+            split_addresses = [f"{base_path}/train", f"{base_path}/valid"]
+
+    if not kpt_labels and split_addresses:
+        kpt_labels = sort_keypoint_labels(_collect_keypoint_labels_from_split_dirs(split_addresses))
+
+    kpt_num = len(kpt_labels) if kpt_labels else db_kpt_num
+    if kpt_num <= 0:
+        raise ValueError("pose 任务缺少 kpt_labels/kpt_num，请先调用 /algorithm/datasets/stats 或确认 point 落在 rectangle 内")
+
+    if kpt_labels and len(kpt_labels) != kpt_num:
+        kpt_num = len(kpt_labels)
+
+    should_persist = (
+        persist
+        and kpt_labels
+        and (
+            kpt_labels != db_kpt_labels
+            or kpt_num != db_kpt_num
+        )
+    )
+    if should_persist:
+        db_manager.update_dataset_keypoint_config(dataset_id, kpt_labels, kpt_num)
+
+    return kpt_labels, kpt_num
 
 
 @app.route('/algorithm/datasets/create', methods=['POST'])
@@ -4384,9 +4704,7 @@ def create_dataset():
         logger.info(f"处理训练集路径: {original_train_data_address} -> {local_train_address}")
         logger.info(f"处理验证集路径: {original_val_data_address} -> {local_val_address}")
         
-        import shutil
-
-        dataset_minio_address = build_storage_minio_path('train_data', str(dataset_id))
+        dataset_storage_address = build_storage_path('train_data', str(dataset_id))
         output_root = build_storage_local_path('train_data', str(dataset_id), require_exists=False)
         datasets_root = output_root / "datasets"
 
@@ -4413,41 +4731,25 @@ def create_dataset():
             if not src_train_labels.exists():
                 return jsonify({"code": 1, "data": {"message": f"训练集labels目录不存在: {src_train_labels}"}}), 400
             
-            train_images_count = 0
-            for file_path in src_train_images.iterdir():
-                if file_path.is_file():
-                    shutil.copy2(file_path, train_images_dir / file_path.name)
-                    train_images_count += 1
-            logger.info(f"训练集images复制完成: {src_train_images} -> {train_images_dir}")
-            
-            train_labels_count = 0
-            for file_path in src_train_labels.iterdir():
-                if file_path.is_file():
-                    shutil.copy2(file_path, train_labels_dir / file_path.name)
-                    train_labels_count += 1
-            logger.info(f"训练集labels复制完成: {src_train_labels} -> {train_labels_dir}")
-            
+            train_images_count = copy_directory_files_parallel(src_train_images, train_images_dir)
+            logger.info(f"训练集images复制完成: {src_train_images} -> {train_images_dir}, count={train_images_count}")
+
+            train_labels_count = copy_directory_files_parallel(src_train_labels, train_labels_dir)
+            logger.info(f"训练集labels复制完成: {src_train_labels} -> {train_labels_dir}, count={train_labels_count}")
+
             src_val_images = Path(local_val_address) / "images"
             src_val_labels = Path(local_val_address) / "labels"
-            
+
             if not src_val_images.exists():
                 return jsonify({"code": 1, "data": {"message": f"验证集images目录不存在: {src_val_images}"}}), 400
             if not src_val_labels.exists():
                 return jsonify({"code": 1, "data": {"message": f"验证集labels目录不存在: {src_val_labels}"}}), 400
-            
-            valid_images_count = 0
-            for file_path in src_val_images.iterdir():
-                if file_path.is_file():
-                    shutil.copy2(file_path, valid_images_dir / file_path.name)
-                    valid_images_count += 1
-            logger.info(f"验证集images复制完成: {src_val_images} -> {valid_images_dir}")
-            
-            valid_labels_count = 0
-            for file_path in src_val_labels.iterdir():
-                if file_path.is_file():
-                    shutil.copy2(file_path, valid_labels_dir / file_path.name)
-                    valid_labels_count += 1
-            logger.info(f"验证集labels复制完成: {src_val_labels} -> {valid_labels_dir}")
+
+            valid_images_count = copy_directory_files_parallel(src_val_images, valid_images_dir)
+            logger.info(f"验证集images复制完成: {src_val_images} -> {valid_images_dir}, count={valid_images_count}")
+
+            valid_labels_count = copy_directory_files_parallel(src_val_labels, valid_labels_dir)
+            logger.info(f"验证集labels复制完成: {src_val_labels} -> {valid_labels_dir}, count={valid_labels_count}")
 
             if train_images_count == 0:
                 return jsonify({"code": 1, "data": {"message": f"训练集图片为空: {src_train_images}"}}), 400
@@ -4461,7 +4763,7 @@ def create_dataset():
             local_dataset_address = str(output_root.resolve())
             logger.info(f"数据集创建成功: {local_dataset_address}")
 
-            dataset_object_path = parse_storage_object_path(dataset_minio_address)
+            dataset_object_path = parse_storage_relative_path(dataset_storage_address)
             delete_storage_prefix(f"{dataset_object_path}/datasets")
             success_count, fail_count, failed_files = upload_directory_to_storage(
                 datasets_root,
@@ -4471,11 +4773,11 @@ def create_dataset():
                 return jsonify({
                     "code": 1,
                     "data": {
-                        "message": f"数据集上传对象存储失败: fail_count={fail_count}",
+                        "message": f"数据集保存到本地工作区失败: fail_count={fail_count}",
                         "failed_files": failed_files[:10]
                     }
                 }), 500
-            logger.info(f"数据集目录已上传到对象存储: {dataset_minio_address}/datasets, count={success_count}")
+            logger.info(f"数据集目录已保存到本地工作区: {dataset_storage_address}/datasets, count={success_count}")
             
         except FileNotFoundError as e:
             logger.error(f"数据集创建失败，路径不存在: {str(e)}")
@@ -4484,14 +4786,14 @@ def create_dataset():
             logger.error(f"数据集创建失败: {str(e)}")
             return jsonify({"code": 1, "data": {"message": f"数据集创建失败: {str(e)}"}}), 500
         
-        if not db_manager.update_dataset_address(dataset_id, dataset_minio_address):
+        if not db_manager.update_dataset_address(dataset_id, dataset_storage_address):
             logger.warning("数据集创建成功但数据库更新dataset_address失败")
             return jsonify({
                 "code": 1,
                 "data": {
                     "message": "数据集创建成功，但数据库更新dataset_address失败",
                     "dataset_id": dataset_id,
-                    "dataset_address": dataset_minio_address
+                    "dataset_address": dataset_storage_address
                 }
             }), 500
         
@@ -4500,8 +4802,8 @@ def create_dataset():
             "data": {
                 "message": "数据集创建成功",
                 "dataset_id": dataset_id,
-                "dataset_address": dataset_minio_address,
-                "minio_address": dataset_minio_address,
+                "dataset_address": dataset_storage_address,
+                "storage_address": dataset_storage_address,
                 "local_address": local_dataset_address,
                 "user_name": user_name
             }
@@ -4559,6 +4861,18 @@ def batch_modify_dataset_labels():
             total_failed_files += split_result['failed_count']
 
         stats_result = collect_dataset_stats_result(dataset_id)
+        try:
+            new_hash = compute_original_dataset_hash(dataset_id)
+            if new_hash:
+                db_manager.update_dataset_original_hash(
+                    dataset_id,
+                    new_hash,
+                    schema_version=ORIGINAL_DATASET_HASH_SCHEMA_VERSION,
+                )
+                stats_result['original_dataset_hash'] = new_hash
+                stats_result['original_dataset_hash_schema'] = ORIGINAL_DATASET_HASH_SCHEMA_VERSION
+        except Exception as e:
+            logger.warning(f"批量修改标签后写入original_dataset_hash失败: dataset_id={dataset_id}, error={str(e)}")
 
         return jsonify({
             "code": 0,
@@ -4603,7 +4917,7 @@ def collect_dataset_stats():
 
     dataset_lock = get_dataset_lock(dataset_id)
     if not dataset_lock.acquire(blocking=False):
-        logger.warning(f"数据集统计任务正在进行中，跳过重复请求: dataset_id={dataset_id}")
+        logger.warning(f"数据集统计任务正在进行中,跳过重复请求: dataset_id={dataset_id}")
         return dataset_processing_response(dataset_id, "数据集统计")
 
     try:
@@ -4611,11 +4925,71 @@ def collect_dataset_stats():
         if not dataset_info:
             return jsonify({"code": 1, "data": {"message": f"未找到dataset_id={dataset_id}的数据集信息"}}), 404
 
+        # 哈希校验:若 original_dataset/{dataset_id} 目录内容未变,跳过统计流程
+        force_stats = parse_bool_param(data.get('force'), default=False)
+        previous_hash_info = db_manager.get_dataset_original_hash_info(dataset_id) or {}
+        previous_hash = previous_hash_info.get('hash')
+        previous_hash_schema = previous_hash_info.get('schema')
+        try:
+            current_hash = compute_original_dataset_hash(dataset_id)
+        except Exception as e:
+            logger.warning(f"计算original_dataset目录哈希失败,继续执行统计: dataset_id={dataset_id}, error={str(e)}")
+            current_hash = None
+
+        pose_fields_complete = True
+        dataset_duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+        dataset_draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
+        if dataset_duty_type == 'pose' or dataset_draw_type == 'point':
+            db_kpt_labels = parse_json_array_field(dataset_info.get('kpt_labels'))
+            try:
+                db_kpt_num = int(dataset_info.get('kpt_num') or 0)
+            except (TypeError, ValueError):
+                db_kpt_num = 0
+            pose_fields_complete = bool(db_kpt_labels and db_kpt_num == len(db_kpt_labels))
+
+        if (
+            not force_stats
+            and current_hash
+            and previous_hash
+            and current_hash == previous_hash
+            and (not previous_hash_schema or previous_hash_schema == ORIGINAL_DATASET_HASH_SCHEMA_VERSION)
+            and pose_fields_complete
+        ):
+            logger.info(
+                f"original_dataset目录哈希未变,跳过数据集统计: dataset_id={dataset_id}, hash={current_hash}"
+            )
+            return jsonify({
+                "code": 0,
+                "data": {
+                    "message": "原始数据集目录未变更,跳过统计",
+                    "dataset_id": dataset_id,
+                    "skipped": True,
+                    "original_dataset_hash": current_hash,
+                    "original_dataset_hash_schema": ORIGINAL_DATASET_HASH_SCHEMA_VERSION
+                }
+            })
+
         stats_result = collect_dataset_stats_result(dataset_id)
+
+        # stats 阶段会修改目录(补负样本 json、删除孤立 json),统计完成后重新计算并写库
+        try:
+            new_hash = compute_original_dataset_hash(dataset_id)
+            if new_hash:
+                db_manager.update_dataset_original_hash(
+                    dataset_id,
+                    new_hash,
+                    schema_version=ORIGINAL_DATASET_HASH_SCHEMA_VERSION,
+                )
+                stats_result['original_dataset_hash'] = new_hash
+                stats_result['original_dataset_hash_schema'] = ORIGINAL_DATASET_HASH_SCHEMA_VERSION
+        except Exception as e:
+            logger.warning(f"统计完成后写入original_dataset_hash失败: dataset_id={dataset_id}, error={str(e)}")
+
         return jsonify({
             "code": 0,
             "data": {
                 "message": "数据集统计完成",
+                "skipped": False,
                 **stats_result
             }
         })
@@ -4663,106 +5037,182 @@ def build_yolo_dataset():
         except ValidationError as e:
             return jsonify({"code": 1, "data": {"message": str(e)}}), 400
 
-        existing_task = dataset_build_tasks.get(str(dataset_id))
-        if existing_task and existing_task.get('status') == 'processing':
-            logger.warning(f"数据集构建任务已在进行中，跳过重复请求: dataset_id={dataset_id}")
-            return jsonify({
-                "code": 0,
-                "data": {
-                    "message": "数据集构建任务已在进行中",
-                    "dataset_id": dataset_id,
-                    "status": "processing"
-                }
-            })
-        
-        logger.info(f"收到构建YOLO数据集请求: dataset_id={dataset_id}，启动异步处理")
-        
-        def async_build_pipeline(dataset_id):
-            start_time = time.time()
-            dataset_id_str = str(dataset_id)
-            
-            dataset_build_tasks[dataset_id_str] = {
+        # 原子地"检查并占位"：在启动线程前持锁写入 processing 状态，
+        # 避免两个快速请求同时通过检查后并发删除/重建同一 dataset。
+        now = datetime.now()
+        with dataset_build_tasks_lock:
+            existing_task = dataset_build_tasks.get(str(dataset_id))
+            if existing_task and existing_task.get('status') == 'processing':
+                logger.warning(f"数据集构建任务已在进行中，跳过重复请求: dataset_id={dataset_id}")
+                return jsonify({
+                    "code": 0,
+                    "data": {
+                        "message": "数据集构建任务已在进行中",
+                        "dataset_id": dataset_id,
+                        "status": "processing"
+                    }
+                })
+            dataset_build_tasks[str(dataset_id)] = {
                 'status': 'processing',
                 'stage': 'initializing',
                 'current_stage_index': 0,
                 'total_stages': 3,
                 'error': None,
-                'start_time': datetime.now(),
-                'end_time': None
+                'start_time': now,
+                'end_time': None,
+                'stage_started_at': now,
+                'last_heartbeat_at': now,
+                'last_progress_at': None,
+                'message': '数据集构建任务初始化',
+                'sub_step': 'initializing',
+                'processed_files': None,
+                'total_files': None,
+                'watchdog_warnings': 0
             }
-            
-            stages = [
-                {
-                    'name': 'convert', 
-                    'description': '标注格式转换',
-                    'handler': _process_json2txt
-                },
-                {
-                    'name': 'build',
-                    'description': '构建训练数据集结构',
-                    'handler': _process_create_dataset
-                },
-                {
-                    'name': 'configure',
-                    'description': '生成训练配置文件',
-                    'handler': _process_generate_yaml
-                }
-            ]
-            
-            total_stages = len(stages)
-            
-            for idx, stage in enumerate(stages, 1):
-                stage_name = stage['name']
-                stage_start = time.time()
-                logger.info(f"[异步][{idx}/{total_stages}] {stage['description']}: dataset_id={dataset_id}")
-                
-                dataset_build_tasks[dataset_id_str]['stage'] = stage_name
-                dataset_build_tasks[dataset_id_str]['current_stage_index'] = idx
-                
-                try:
-                    result = stage['handler'](dataset_id)
-                    stage_duration = round(time.time() - stage_start, 2)
-                    
-                    if not result.get('success'):
-                        error_msg = result.get('error', '未知错误')
-                        logger.error(f"[异步][{idx}/{total_stages}] 失败: {error_msg}")
-                        dataset_build_tasks[dataset_id_str]['status'] = 'failed'
-                        dataset_build_tasks[dataset_id_str]['error'] = error_msg
-                        dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
-                        return
-                    
-                    logger.info(f"[异步][{idx}/{total_stages}] 完成 ({stage_duration}s)")
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    logger.error(f"[异步][{idx}/{total_stages}] 异常: {error_msg}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+
+        logger.info(f"收到构建YOLO数据集请求: dataset_id={dataset_id}，启动异步处理")
+
+        def async_build_pipeline(dataset_id):
+            start_time = time.time()
+            dataset_id_str = str(dataset_id)
+            callback_success = False
+            callback_message = None
+
+            watchdog_stop_event = threading.Event()
+            start_dataset_build_watchdog(dataset_id, watchdog_stop_event)
+            update_dataset_build_heartbeat(
+                dataset_id,
+                stage='initializing',
+                sub_step='initializing',
+                message='数据集构建任务初始化',
+                force_log=True
+            )
+
+            try:
+                if not db_manager.update_dataset_process_status(dataset_id, 0):
+                    error_msg = "开始构建时更新train_dataset.process_status为0失败"
+                    logger.error(f"[异步] {error_msg}: dataset_id={dataset_id}")
                     dataset_build_tasks[dataset_id_str]['status'] = 'failed'
                     dataset_build_tasks[dataset_id_str]['error'] = error_msg
                     dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                    callback_message = error_msg
                     return
 
-            if not db_manager.update_dataset_process_status(dataset_id, 1):
-                error_msg = "全部处理完成，但更新train_dataset.process_status为1失败"
-                logger.error(f"[异步] {error_msg}: dataset_id={dataset_id}")
+                stages = [
+                    {
+                        'name': 'convert',
+                        'description': '标注格式转换',
+                        'handler': _process_json2txt
+                    },
+                    {
+                        'name': 'build',
+                        'description': '构建训练数据集结构',
+                        'handler': _process_create_dataset
+                    },
+                    {
+                        'name': 'configure',
+                        'description': '生成训练配置文件',
+                        'handler': _process_generate_yaml
+                    }
+                ]
+
+                total_stages = len(stages)
+
+                for idx, stage in enumerate(stages, 1):
+                    stage_name = stage['name']
+                    stage_start = time.time()
+                    logger.info(f"[异步][{idx}/{total_stages}] {stage['description']}: dataset_id={dataset_id}")
+
+                    with dataset_build_tasks_lock:
+                        dataset_build_tasks[dataset_id_str]['stage'] = stage_name
+                        dataset_build_tasks[dataset_id_str]['current_stage_index'] = idx
+                        dataset_build_tasks[dataset_id_str]['stage_started_at'] = datetime.now()
+                        dataset_build_tasks[dataset_id_str]['processed_files'] = None
+                        dataset_build_tasks[dataset_id_str]['total_files'] = None
+                    update_dataset_build_heartbeat(
+                        dataset_id,
+                        stage=stage_name,
+                        sub_step='stage_start',
+                        message=f"开始{stage['description']}",
+                        force_log=True
+                    )
+
+                    try:
+                        result = stage['handler'](dataset_id)
+                        stage_duration = round(time.time() - stage_start, 2)
+
+                        if not result.get('success'):
+                            error_msg = result.get('error', '未知错误')
+                            logger.error(f"[异步][{idx}/{total_stages}] 失败: {error_msg}")
+                            dataset_build_tasks[dataset_id_str]['status'] = 'failed'
+                            dataset_build_tasks[dataset_id_str]['error'] = error_msg
+                            dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                            db_manager.update_dataset_process_status(dataset_id, 2, error_msg)
+                            callback_message = error_msg
+                            return
+
+                        update_dataset_build_heartbeat(
+                            dataset_id,
+                            stage=stage_name,
+                            sub_step='stage_done',
+                            message=f"{stage['description']}完成，耗时 {stage_duration}s",
+                            force_log=True
+                        )
+                        logger.info(f"[异步][{idx}/{total_stages}] 完成 ({stage_duration}s)")
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        logger.error(f"[异步][{idx}/{total_stages}] 异常: {error_msg}")
+                        logger.error(traceback.format_exc())
+                        dataset_build_tasks[dataset_id_str]['status'] = 'failed'
+                        dataset_build_tasks[dataset_id_str]['error'] = error_msg
+                        dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                        db_manager.update_dataset_process_status(dataset_id, 2, error_msg)
+                        callback_message = error_msg
+                        return
+
+                if not db_manager.update_dataset_process_status(dataset_id, 1):
+                    error_msg = "全部处理完成，但更新train_dataset.process_status为1失败"
+                    logger.error(f"[异步] {error_msg}: dataset_id={dataset_id}")
+                    dataset_build_tasks[dataset_id_str]['status'] = 'failed'
+                    dataset_build_tasks[dataset_id_str]['error'] = error_msg
+                    dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                    dataset_build_tasks[dataset_id_str]['stage'] = 'done'
+                    dataset_build_tasks[dataset_id_str]['current_stage_index'] = total_stages
+                    db_manager.update_dataset_process_status(dataset_id, 2, error_msg)
+                    callback_message = error_msg
+                    return
+
+                total_duration = round(time.time() - start_time, 2)
+                logger.info(f"[异步] YOLO数据集构建流程完成: dataset_id={dataset_id}, 耗时: {total_duration}s")
+
+                dataset_build_tasks[dataset_id_str]['status'] = 'completed'
+                dataset_build_tasks[dataset_id_str]['stage'] = 'done'
+                dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                callback_success = True
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"[异步] YOLO数据集构建流程异常: dataset_id={dataset_id}, error={error_msg}")
+                logger.error(traceback.format_exc())
                 dataset_build_tasks[dataset_id_str]['status'] = 'failed'
                 dataset_build_tasks[dataset_id_str]['error'] = error_msg
                 dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
-                dataset_build_tasks[dataset_id_str]['stage'] = 'done'
-                dataset_build_tasks[dataset_id_str]['current_stage_index'] = total_stages
-                return
-            
-            total_duration = round(time.time() - start_time, 2)
-            logger.info(f"[异步] YOLO数据集构建流程完成: dataset_id={dataset_id}, 耗时: {total_duration}s")
-            
-            dataset_build_tasks[dataset_id_str]['status'] = 'completed'
-            dataset_build_tasks[dataset_id_str]['stage'] = 'done'
-            dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
-        
+                callback_message = error_msg
+            finally:
+                watchdog_stop_event.set()
+                send_process_callback(dataset_id, callback_success, callback_message)
+
         thread = threading.Thread(target=async_build_pipeline, args=(dataset_id,), daemon=True)
-        thread.start()
-        
+        try:
+            thread.start()
+        except Exception:
+            # 线程启动失败时释放已占位的 processing 槽，避免数据集卡在 processing
+            with dataset_build_tasks_lock:
+                current = dataset_build_tasks.get(str(dataset_id))
+                if current and current.get('status') == 'processing':
+                    dataset_build_tasks.pop(str(dataset_id), None)
+            raise
+
         return jsonify({
             "code": 0,
             "data": {
@@ -4778,7 +5228,6 @@ def build_yolo_dataset():
 
 def _process_divided_original_detail(dataset_id):
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    import random
     
     dataset_info = db_manager.get_divided_data_address(dataset_id)
     if not dataset_info:
@@ -4799,7 +5248,7 @@ def _process_divided_original_detail(dataset_id):
         analyzer = DatasetDetailAnalyzer(address)
         return analyzer.analyze_dataset()
     
-    def find_sample_images_for_labels(local_address, minio_base_path, tag_num_dict):
+    def find_sample_images_for_labels(local_address, base_path, tag_num_dict):
         """为每个标签找一张包含该类型的示例图片"""
         label_images = {}
         json_dir = resolve_annotation_dir(local_address)
@@ -4846,7 +5295,7 @@ def _process_divided_original_detail(dataset_id):
         for label_name, images in label_to_images.items():
             if images:
                 selected_image = random.choice(images)
-                object_key = f"{minio_base_path}/images/{selected_image}"
+                object_key = f"{base_path}/images/{selected_image}"
                 label_images[label_name] = object_key
                 logger.debug(f"标签 {label_name} 选择图片: {object_key}")
         
@@ -4891,18 +5340,11 @@ def _process_divided_original_detail(dataset_id):
         return {'success': False, 'error': "数据库更新失败"}
     
     try:
-        def extract_minio_base_path(minio_path):
-            if minio_path.startswith('minio://'):
-                parts = minio_path.replace('minio://', '').split('/', 1)
-                if len(parts) > 1:
-                    return parts[1]
-            return minio_path
+        train_base_path = original_train_data_address
+        val_base_path = original_val_data_address
         
-        train_minio_base = extract_minio_base_path(original_train_data_address)
-        val_minio_base = extract_minio_base_path(original_val_data_address)
-        
-        train_label_images = find_sample_images_for_labels(local_train_address, train_minio_base, train_tag_num_dict)
-        val_label_images = find_sample_images_for_labels(local_val_address, val_minio_base, val_tag_num_dict)
+        train_label_images = find_sample_images_for_labels(local_train_address, train_base_path, train_tag_num_dict)
+        val_label_images = find_sample_images_for_labels(local_val_address, val_base_path, val_tag_num_dict)
         
         label_data_list = []
         
@@ -4956,70 +5398,94 @@ def _process_divided_original_detail(dataset_id):
 
 def _process_json2txt(dataset_id):
     from concurrent.futures import ThreadPoolExecutor
-    import shutil
-    
+
     dataset_info = db_manager.get_dataset_json2txt_info(dataset_id)
     if not dataset_info:
         return {'success': False, 'error': f"未找到dataset_id={dataset_id}的数据集信息"}
-    
-    duty_type = dataset_info.get('duty_type')
+
+    duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+    draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
     original_train_data_address = dataset_info.get('original_train_data_address')
     original_val_data_address = dataset_info.get('original_val_data_address')
     labels_str = dataset_info.get('labels')
-    
+
     if not duty_type or not labels_str:
         return {'success': False, 'error': "缺少duty_type或labels"}
-    
+
     if not original_train_data_address and not original_val_data_address:
         return {'success': False, 'error': "original_train_data_address和original_val_data_address都为空"}
-    
+
+    # point 数据集判定与 stats/yaml 阶段保持一致：duty_type=='pose' 或 draw_type=='point'
+    # 都按 pose 处理。否则 json2txt 会把矩形当检测框、丢弃关键点，产出 5 列检测标签，
+    # 而 yaml 仍写出 kpt_shape，训练前校验必然失败。
+    is_pose = duty_type == 'pose' or draw_type == 'point'
+    effective_duty_type = 'pose' if is_pose else duty_type
+
     labels_list = parse_labels(labels_str)
-    
+
     class_mapping = {label: idx for idx, label in enumerate(labels_list)}
     logger.info(f"标签映射字典: {class_mapping}")
-    
-    def convert_dataset(address, minio_path):
+
+    kpt_labels = None
+    kpt_num = None
+    if is_pose:
+        try:
+            kpt_labels, kpt_num = resolve_pose_keypoint_config(
+                dataset_id,
+                dataset_info,
+                split_addresses=[original_train_data_address, original_val_data_address],
+                persist=True,
+            )
+        except ValueError as e:
+            return {'success': False, 'error': str(e)}
+        logger.info(f"pose 任务关键点标签: {kpt_labels}, kpt_num: {kpt_num}")
+
+    def convert_dataset(address, storage_path):
         split_name = '训练集' if address == original_train_data_address else '验证集'
         local_address = resolve_dataset_dir_for_conversion(address, split_name)
-        
+
         labels_dir = Path(local_address) / 'labels'
         if labels_dir.exists():
             logger.info(f"删除已存在的labels目录: {labels_dir}")
             safe_rmtree(labels_dir)
-        
+
         converter = UnifiedJsonConverter(
-            duty_type=duty_type,
+            duty_type=effective_duty_type,
             original_train_data_address=local_address,
-            predefined_labels=labels_list
+            predefined_labels=labels_list,
+            kpt_labels=kpt_labels,
+            kpt_num=kpt_num,
         )
         result = converter.convert()
-        
-        if PathHandler.is_minio_path(minio_path):
-            _upload_labels_to_minio(converter.labels_dir, minio_path)
-        
+
+        if PathHandler.is_legacy_remote_uri(storage_path):
+            _copy_labels_to_storage(converter.labels_dir, storage_path)
+
         return result
-    
+
     train_result = None
     val_result = None
-    
+
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {}
         if original_train_data_address:
             futures['train'] = executor.submit(convert_dataset, original_train_data_address, original_train_data_address)
         if original_val_data_address:
             futures['val'] = executor.submit(convert_dataset, original_val_data_address, original_val_data_address)
-        
+
         if 'train' in futures:
             train_result = futures['train'].result()
         if 'val' in futures:
             val_result = futures['val'].result()
-    
+
     return {
         'success': True,
         'output': {
             'format': 'YOLO TXT',
-            'task_type': duty_type,
+            'task_type': effective_duty_type,
             'class_mapping': class_mapping,
+            'kpt_num': kpt_num,
+            'kpt_labels': kpt_labels,
             'train_set': {
                 'converted': train_result.get('success', 0) if train_result else 0,
                 'failed': train_result.get('failed', 0) if train_result else 0
@@ -5032,8 +5498,39 @@ def _process_json2txt(dataset_id):
     }
 
 
+def _collect_keypoint_labels_from_split_dirs(addresses):
+    """扫描 split 目录中的 JSON，收集出现过的 point 标签（按出现顺序去重）"""
+    seen = []
+    for address in addresses:
+        if not address:
+            continue
+        try:
+            local_dir = Path(ensure_local_path(address))
+        except Exception as e:
+            logger.warning(f"解析关键点标签时无法定位本地路径: {address}, error={e}")
+            continue
+        json_dir = None
+        for sub in ('json', 'jsons'):
+            candidate = local_dir / sub
+            if candidate.exists():
+                json_dir = candidate
+                break
+        if json_dir is None:
+            continue
+        for json_file in sorted(json_dir.glob('*.json')):
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            assignment = assign_points_to_rectangles(data.get('shapes') or [])
+            for kp_label in assignment.keypoint_labels:
+                if kp_label and kp_label not in seen:
+                    seen.append(kp_label)
+    return seen
+
+
 def _process_create_dataset(dataset_id):
-    import shutil
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     MAX_COPY_WORKERS = 16
@@ -5047,24 +5544,36 @@ def _process_create_dataset(dataset_id):
             logger.error(f"复制文件失败 {src}: {e}")
             return False
     
-    def parallel_copy_files(src_dir, dest_dir):
+    def make_progress_callback(sub_step, action_name):
+        def progress_callback(processed_files, total_files):
+            update_dataset_build_heartbeat(
+                dataset_id,
+                stage='build',
+                sub_step=sub_step,
+                message=f"{action_name}: {processed_files}/{total_files}",
+                processed_files=processed_files,
+                total_files=total_files,
+                force_log=True
+            )
+        return progress_callback
+
+    def parallel_copy_files(src_dir, dest_dir, sub_step, action_name):
         """并行复制目录中的所有文件"""
-        files_to_copy = []
-        for file_path in src_dir.iterdir():
-            if file_path.is_file():
-                files_to_copy.append((file_path, dest_dir / file_path.name))
-        
-        if not files_to_copy:
-            return 0
-        
-        success_count = 0
-        with ThreadPoolExecutor(max_workers=MAX_COPY_WORKERS) as executor:
-            futures = [executor.submit(copy_file, item) for item in files_to_copy]
-            for future in as_completed(futures):
-                if future.result():
-                    success_count += 1
-        
-        return success_count
+        update_dataset_build_heartbeat(
+            dataset_id,
+            stage='build',
+            sub_step=sub_step,
+            message=f"开始{action_name}",
+            processed_files=0,
+            total_files=None,
+            force_log=True
+        )
+        return copy_directory_files_parallel(
+            src_dir,
+            dest_dir,
+            max_workers=MAX_COPY_WORKERS,
+            progress_callback=make_progress_callback(sub_step, action_name)
+        )
     
     dataset_info = db_manager.get_dataset_split_info(dataset_id)
     if not dataset_info:
@@ -5081,7 +5590,7 @@ def _process_create_dataset(dataset_id):
     local_train_address = materialize_dataset_dir_for_create(original_train_data_address, '训练集')
     local_val_address = materialize_dataset_dir_for_create(original_val_data_address, '验证集')
 
-    dataset_minio_address = build_storage_minio_path('train_data', str(dataset_id))
+    dataset_storage_address = build_storage_path('train_data', str(dataset_id))
     output_root = build_storage_local_path('train_data', str(dataset_id), require_exists=False)
     datasets_root = output_root / "datasets"
     
@@ -5107,8 +5616,8 @@ def _process_create_dataset(dataset_id):
         return {'success': False, 'error': f"训练集labels目录不存在: {src_train_labels}"}
     
     # 并行复制训练集文件
-    train_images_count = parallel_copy_files(src_train_images, train_images_dir)
-    train_labels_count = parallel_copy_files(src_train_labels, train_labels_dir)
+    train_images_count = parallel_copy_files(src_train_images, train_images_dir, 'train_images', '复制训练集图片')
+    train_labels_count = parallel_copy_files(src_train_labels, train_labels_dir, 'train_labels', '复制训练集标签')
     
     src_val_images = Path(local_val_address) / "images"
     src_val_labels = Path(local_val_address) / "labels"
@@ -5118,8 +5627,8 @@ def _process_create_dataset(dataset_id):
     if not src_val_labels.exists():
         return {'success': False, 'error': f"验证集labels目录不存在: {src_val_labels}"}
     
-    valid_images_count = parallel_copy_files(src_val_images, valid_images_dir)
-    valid_labels_count = parallel_copy_files(src_val_labels, valid_labels_dir)
+    valid_images_count = parallel_copy_files(src_val_images, valid_images_dir, 'valid_images', '复制验证集图片')
+    valid_labels_count = parallel_copy_files(src_val_labels, valid_labels_dir, 'valid_labels', '复制验证集标签')
 
     if train_images_count == 0:
         return {'success': False, 'error': f"训练集图片为空: {src_train_images}"}
@@ -5132,25 +5641,51 @@ def _process_create_dataset(dataset_id):
     
     local_dataset_address = str(output_root.resolve())
 
-    dataset_object_path = parse_storage_object_path(dataset_minio_address)
+    dataset_object_path = parse_storage_relative_path(dataset_storage_address)
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='build',
+        sub_step='prepare_upload_storage',
+        message='准备保存训练数据集结构',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
     delete_storage_prefix(f"{dataset_object_path}/datasets")
     success_count, fail_count, failed_files = upload_directory_to_storage(
         datasets_root,
-        f"{dataset_object_path}/datasets"
+        f"{dataset_object_path}/datasets",
+        progress_callback=make_progress_callback('upload_storage', '保存训练数据集结构')
     )
     if fail_count:
         return {
             'success': False,
-            'error': f"上传训练数据集到对象存储失败: fail_count={fail_count}, failed_files={failed_files[:5]}"
+            'error': f"保存训练数据集到本地工作区失败: fail_count={fail_count}, failed_files={failed_files[:5]}"
         }
 
-    if not db_manager.update_dataset_address(dataset_id, dataset_minio_address):
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='build',
+        sub_step='update_db',
+        message='更新训练数据集地址到数据库',
+        force_log=True
+    )
+    if not db_manager.update_dataset_address(dataset_id, dataset_storage_address):
         return {'success': False, 'error': "数据库更新dataset_address失败"}
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='build',
+        sub_step='build_done',
+        message='训练数据集结构构建完成',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
     
     return {
         'success': True,
         'output': {
-            'dataset_path': dataset_minio_address,
+            'dataset_path': dataset_storage_address,
             'local_dataset_path': local_dataset_address,
             'structure': {
                 'train': {
@@ -5175,43 +5710,102 @@ def _process_generate_yaml(dataset_id):
     dataset_address = dataset_info.get('dataset_address')
     labels = dataset_info.get('labels')
     label_num = dataset_info.get('label_num')
-    
+    draw_type = dataset_info.get('draw_type')
+    duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+    kpt_labels = None
+    kpt_num = dataset_info.get('kpt_num')
+
     if not dataset_address or not labels or not label_num:
         return {'success': False, 'error': "缺少dataset_address、labels或label_num"}
-    
+
+    duty_type_for_yaml = 'pose' if duty_type == 'pose' or draw_type == 'point' else None
+    if duty_type_for_yaml == 'pose':
+        try:
+            kpt_labels, kpt_num = resolve_pose_keypoint_config(dataset_id, dataset_info, persist=True)
+        except ValueError as e:
+            return {'success': False, 'error': str(e)}
+
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='configure',
+        sub_step='resolve_dataset_path',
+        message='解析训练数据集本地路径',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
     local_dataset_address = ensure_local_path(dataset_address)
     Path(local_dataset_address).mkdir(parents=True, exist_ok=True)
-    
+
     from utils import DatasetYamlGenerator
-    
+
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='configure',
+        sub_step='generate_yaml',
+        message='生成 YOLO dataset.yaml',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
     generator = DatasetYamlGenerator()
     yaml_output_path = Path(local_dataset_address) / "dataset.yaml"
     result = generator.generate_silent(
         dataset_address=local_dataset_address,
         labels=labels,
         label_num=label_num,
-        output_path=str(yaml_output_path)
+        output_path=str(yaml_output_path),
+        duty_type=duty_type_for_yaml,
+        kpt_num=int(kpt_num) if kpt_num else None
     )
     
     if not result['success']:
         return {'success': False, 'error': result.get('error', '未知错误')}
     
     local_yaml_path = result['yaml_path']
-    
+
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='configure',
+        sub_step='save_yaml_address',
+        message='保存 YAML 地址信息',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
     yaml_address = normalize_address_for_db(local_yaml_path)
-    if PathHandler.is_minio_path(yaml_address):
+    if PathHandler.is_legacy_remote_uri(yaml_address):
         upload_file_to_storage(
             Path(local_yaml_path),
-            parse_storage_object_path(yaml_address),
+            parse_storage_relative_path(yaml_address),
             content_type='application/x-yaml'
         )
-        logger.info(f"YAML文件已上传到对象存储: {yaml_address}")
+        logger.info(f"YAML文件已保存到本地工作区: {yaml_address}")
 
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='configure',
+        sub_step='update_db',
+        message='更新 YAML 地址到数据库',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
     db_manager.update_dataset_yaml_address(dataset_id, yaml_address)
-    
+    update_dataset_build_heartbeat(
+        dataset_id,
+        stage='configure',
+        sub_step='configure_done',
+        message='训练配置文件生成完成',
+        processed_files=0,
+        total_files=0,
+        force_log=True
+    )
+
     try:
         labels_list = json.loads(labels) if isinstance(labels, str) else labels
-    except Exception:
+    except Exception as e:
+        logger.debug(f"解析labels失败，使用空列表: {e}")
         labels_list = []
     
     return {
@@ -5223,7 +5817,9 @@ def _process_generate_yaml(dataset_id):
             'classes': {
                 'count': label_num,
                 'names': labels_list
-            }
+            },
+            'kpt_num': int(kpt_num) if duty_type_for_yaml == 'pose' and kpt_num else None,
+            'kpt_labels': kpt_labels
         }
     }
 
@@ -5241,8 +5837,10 @@ def get_dataset_build_status():
         
         logger.info(f"查询数据集构建状态: dataset_id={dataset_id}")
         
-        task_info = dataset_build_tasks.get(str(dataset_id))
-        
+        with dataset_build_tasks_lock:
+            task_info = dataset_build_tasks.get(str(dataset_id))
+            task_info = dict(task_info) if task_info else None
+
         if not task_info:
             return jsonify({
                 "code": 0,
@@ -5254,14 +5852,35 @@ def get_dataset_build_status():
             })
         
         # 格式化时间
-        start_time_str = task_info['start_time'].strftime('%Y-%m-%d %H:%M:%S') if task_info.get('start_time') else None
-        end_time_str = task_info['end_time'].strftime('%Y-%m-%d %H:%M:%S') if task_info.get('end_time') else None
-        
+        start_time_str = format_dataset_build_time(task_info.get('start_time'))
+        end_time_str = format_dataset_build_time(task_info.get('end_time'))
+        stage_started_at_str = format_dataset_build_time(task_info.get('stage_started_at'))
+        last_heartbeat_at_str = format_dataset_build_time(task_info.get('last_heartbeat_at'))
+        last_progress_at_str = format_dataset_build_time(task_info.get('last_progress_at'))
+
+        total_stages = task_info.get('total_stages') or 0
+        current_stage_index = task_info.get('current_stage_index')
+        progress = None
+        if total_stages and current_stage_index is not None:
+            progress = round(current_stage_index / total_stages * 100, 1)
+
         return jsonify({
             "code": 0,
             "data": {
                 "dataset_id": dataset_id,
                 "status": task_info['status'],
+                "stage": task_info.get('stage'),
+                "current_stage_index": current_stage_index,
+                "total_stages": total_stages,
+                "progress": progress,
+                "sub_step": task_info.get('sub_step'),
+                "message": task_info.get('message'),
+                "processed_files": task_info.get('processed_files'),
+                "total_files": task_info.get('total_files'),
+                "watchdog_warnings": task_info.get('watchdog_warnings', 0),
+                "stage_started_at": stage_started_at_str,
+                "last_heartbeat_at": last_heartbeat_at_str,
+                "last_progress_at": last_progress_at_str,
                 "error": task_info.get('error'),
                 "start_time": start_time_str,
                 "end_time": end_time_str
@@ -5287,6 +5906,11 @@ def get_train_log():
         train_task_id = data.get('train_task_id')
         if train_task_id is None:
             return jsonify({"code": 1, "data": {"message": "缺少必需参数 train_task_id"}}), 400
+
+        try:
+            train_task_id = validate_positive_id(train_task_id, "train_task_id")
+        except ValidationError as e:
+            return jsonify({"code": 1, "data": {"message": str(e)}}), 400
         
         lines = data.get('lines', 100)
         if not isinstance(lines, int) or lines <= 0:
@@ -5358,7 +5982,6 @@ def get_train_log():
             
     except Exception as e:
         logger.error(f"获取训练日志失败: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         return jsonify({
             "code": 1,
@@ -5412,8 +6035,105 @@ class PredictRedisManager:
 predict_redis_manager = PredictRedisManager(redis_config)
 
 dataset_build_tasks = {}
+dataset_build_tasks_lock = threading.Lock()
 
-import threading
+
+def update_dataset_build_heartbeat(
+    dataset_id,
+    stage=None,
+    sub_step=None,
+    message=None,
+    processed_files=None,
+    total_files=None,
+    force_log=False,
+):
+    dataset_id_str = str(dataset_id)
+    now = datetime.now()
+    with dataset_build_tasks_lock:
+        task_info = dataset_build_tasks.get(dataset_id_str)
+        if not task_info:
+            return False
+
+        previous_stage = task_info.get('stage')
+        if stage:
+            task_info['stage'] = stage
+            if previous_stage != stage:
+                task_info['stage_started_at'] = now
+        if sub_step is not None:
+            task_info['sub_step'] = sub_step
+        if message is not None:
+            task_info['message'] = message
+        if processed_files is not None:
+            task_info['processed_files'] = processed_files
+            task_info['last_progress_at'] = now
+        if total_files is not None:
+            task_info['total_files'] = total_files
+        task_info['last_heartbeat_at'] = now
+
+        log_stage = task_info.get('stage')
+        log_sub_step = task_info.get('sub_step')
+        log_message = task_info.get('message')
+        log_processed = task_info.get('processed_files')
+        log_total = task_info.get('total_files')
+
+    if force_log:
+        progress_text = ''
+        if log_processed is not None and log_total is not None:
+            progress_text = f", progress={log_processed}/{log_total}"
+        logger.info(
+            f"[异步][监测] dataset_id={dataset_id}, stage={log_stage}, "
+            f"sub_step={log_sub_step}{progress_text}, message={log_message}"
+        )
+    return True
+
+
+def start_dataset_build_watchdog(dataset_id, stop_event):
+    dataset_id_str = str(dataset_id)
+
+    def watchdog_loop():
+        while not stop_event.wait(DATASET_BUILD_WATCHDOG_INTERVAL):
+            with dataset_build_tasks_lock:
+                task_info = dataset_build_tasks.get(dataset_id_str)
+                if not task_info or task_info.get('status') != 'processing':
+                    return
+                stage = task_info.get('stage')
+                last_heartbeat_at = task_info.get('last_heartbeat_at') or task_info.get('start_time')
+                sub_step = task_info.get('sub_step')
+                message = task_info.get('message')
+                processed_files = task_info.get('processed_files')
+                total_files = task_info.get('total_files')
+                watchdog_warnings = task_info.get('watchdog_warnings', 0)
+
+            if not last_heartbeat_at:
+                continue
+
+            idle_seconds = (datetime.now() - last_heartbeat_at).total_seconds()
+            idle_threshold = DATASET_BUILD_WATCHDOG_IDLE_SECONDS.get(stage, 600)
+            if idle_seconds < idle_threshold:
+                continue
+
+            with dataset_build_tasks_lock:
+                task_info = dataset_build_tasks.get(dataset_id_str)
+                if not task_info or task_info.get('status') != 'processing':
+                    return
+                task_info['watchdog_warnings'] = task_info.get('watchdog_warnings', 0) + 1
+                watchdog_warnings = task_info['watchdog_warnings']
+
+            logger.warning(
+                f"[异步][监测] 数据集构建长时间无心跳: dataset_id={dataset_id}, "
+                f"stage={stage}, sub_step={sub_step}, idle_seconds={int(idle_seconds)}, "
+                f"warnings={watchdog_warnings}, progress={processed_files}/{total_files}, message={message}"
+            )
+
+    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
+    watchdog_thread.start()
+    return watchdog_thread
+
+
+def format_dataset_build_time(value):
+    return value.strftime('%Y-%m-%d %H:%M:%S') if value else None
+
+
 dataset_process_locks = {}
 dataset_process_locks_lock = threading.Lock()
 
@@ -5447,13 +6167,19 @@ def predict_with_model():
         model_id = data.get('modelId')
         prediction_id = data.get('predictionId')
         confidence = data.get('confidence', 0.25)
-        
+
         if not model_id or prediction_id is None:
             return jsonify({
                 "code": 1,
                 "data": "缺少必要参数: modelId 或 predictionId"
             }), 400
-        
+
+        try:
+            model_id = validate_positive_id(model_id, "modelId")
+            prediction_id = validate_positive_id(prediction_id, "predictionId")
+        except ValidationError as e:
+            return jsonify({"code": 1, "data": str(e)}), 400
+
         try:
             confidence = float(confidence)
         except (ValueError, TypeError):
@@ -5462,6 +6188,7 @@ def predict_with_model():
         logger.info(f"收到推理请求: modelId={model_id}, predictionId={prediction_id}, confidence={confidence}")
         
         predict_redis_manager.update_status(model_id, prediction_id, 'pending')
+        connection = None
         try:
             connection = db_manager.get_connection()
             if connection:
@@ -5469,14 +6196,19 @@ def predict_with_model():
                     sql = "UPDATE train_prediction_record SET status = %s, error_message = NULL WHERE id = %s"
                     cursor.execute(sql, ('pending', prediction_id))
                     connection.commit()
-                connection.close()
                 logger.info(f"已更新预测记录初始状态: prediction_id={prediction_id}, status=pending")
         except Exception as e:
             logger.error(f"更新预测记录初始状态失败: {str(e)}")
+        finally:
+            if connection:
+                connection.close()
         
         # 启动异步推理线程
         def async_predict(model_id, prediction_id, confidence):
+            import cv2
+
             def update_prediction_record(prediction_id, status, error_msg=None):
+                connection = None
                 try:
                     connection = db_manager.get_connection()
                     if connection:
@@ -5488,10 +6220,12 @@ def predict_with_model():
                                 sql = "UPDATE train_prediction_record SET status = %s, error_message = NULL WHERE id = %s"
                                 cursor.execute(sql, (status, prediction_id))
                             connection.commit()
-                        connection.close()
                         logger.info(f"已更新预测记录: prediction_id={prediction_id}, status={status}")
                 except Exception as e:
                     logger.error(f"更新预测记录失败: {str(e)}")
+                finally:
+                    if connection:
+                        connection.close()
             
             try:
                 logger.info(f"[异步推理] 开始: modelId={model_id}, predictionId={prediction_id}")
@@ -5520,8 +6254,8 @@ def predict_with_model():
                             update_prediction_record(prediction_id, 'failed', error_msg)
                             return
                         
-                        model_minio_address = result['bestmodel_address']
-                        logger.info(f"[异步推理] 模型MinIO地址: {model_minio_address}")
+                        model_storage_address = result['bestmodel_address']
+                        logger.info(f"[异步推理] 模型存储地址: {model_storage_address}")
                 finally:
                     connection.close()
                 
@@ -5529,65 +6263,79 @@ def predict_with_model():
                 local_original_path = build_storage_local_path("predict", model_id, prediction_id, "original", require_exists=False)
                 local_results_path = local_base_path / "results"
 
-                if local_original_path.exists():
-                    safe_rmtree(local_original_path)
                 if local_results_path.exists():
                     safe_rmtree(local_results_path)
+                local_original_path.mkdir(parents=True, exist_ok=True)
                 local_results_path.mkdir(parents=True, exist_ok=True)
 
                 original_object_prefix = build_storage_object_key("predict", model_id, prediction_id, "original")
                 downloaded_count = download_storage_prefix(
                     original_object_prefix,
                     local_original_path,
-                    suffixes=DATASET_IMAGE_EXTENSIONS
+                    suffixes=DATASET_IMAGE_EXTENSIONS | DATASET_VIDEO_EXTENSIONS
                 )
                 logger.info(
-                    f"[异步推理] 原始图片已通过S3下载到本地工作区: "
+                    f"[异步推理] 原始素材已定位到本地工作区: "
                     f"{original_object_prefix} -> {local_original_path}, count={downloaded_count}"
                 )
-                
-                local_model_path = ensure_local_path(model_minio_address)
+
+                local_model_path = ensure_local_path(model_storage_address)
                 logger.info(f"[异步推理] 模型本地路径: {local_model_path}")
-                
+
                 if not Path(local_model_path).exists():
                     error_msg = f"模型文件不存在: {local_model_path}"
                     logger.error(f"[异步推理] {error_msg}")
                     predict_redis_manager.update_status(model_id, prediction_id, 'failed')
                     update_prediction_record(prediction_id, 'failed', error_msg)
                     return
-                
-                logger.info(f"[异步推理] 加载模型并开始推理，置信度: {confidence}")
-                
-                model = YOLO(local_model_path)
-                
-                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.JPG', '.JPEG', '.PNG', '.BMP', '.GIF', '.WEBP']
-                image_files = []
-                for ext in image_extensions:
-                    image_files.extend(local_original_path.glob(f'*{ext}'))
-                
-                image_files = list(set(image_files))
-                
-                logger.info(f"[异步推理] 待推理图片数量: {len(image_files)}")
-                logger.info(f"[异步推理] 图片列表: {[f.name for f in image_files]}")
 
-                if not image_files:
-                    error_msg = f"对象存储原始图片前缀中未找到任何图片: {original_object_prefix}"
+                logger.info(f"[异步推理] 加载模型并开始推理，置信度: {confidence}")
+
+                model = YOLO(local_model_path)
+
+                image_files = []
+                video_files = []
+                for entry in local_original_path.iterdir():
+                    if not entry.is_file():
+                        continue
+                    suffix = entry.suffix.lower()
+                    if suffix in DATASET_IMAGE_EXTENSIONS:
+                        image_files.append(entry)
+                    elif suffix in DATASET_VIDEO_EXTENSIONS:
+                        video_files.append(entry)
+
+                image_files = list(set(image_files))
+                video_files = list(set(video_files))
+
+                logger.info(f"[异步推理] 待推理图片数量: {len(image_files)}, 视频数量: {len(video_files)}")
+                logger.info(f"[异步推理] 图片列表: {[f.name for f in image_files]}")
+                logger.info(f"[异步推理] 视频列表: {[f.name for f in video_files]}")
+
+                if not image_files and not video_files:
+                    error_msg = f"本地原始素材目录中未找到任何图片或视频: {local_original_path}"
                     logger.error(f"[异步推理] {error_msg}")
                     predict_redis_manager.update_status(model_id, prediction_id, 'failed')
                     update_prediction_record(prediction_id, 'failed', error_msg)
                     return
-                
+
                 if image_files:
+                    image_only_dir = local_results_path.parent / f"{local_results_path.name}_imgsrc"
+                    if image_only_dir.exists():
+                        safe_rmtree(image_only_dir)
+                    image_only_dir.mkdir(parents=True, exist_ok=True)
+                    for img_path in image_files:
+                        shutil.copy2(str(img_path), str(image_only_dir / img_path.name))
+
                     try:
                         results = model.predict(
-                            source=str(local_original_path),
+                            source=str(image_only_dir),
                             conf=confidence,
                             save=True,
                             project=str(local_results_path.parent),
                             name=local_results_path.name,
                             exist_ok=True
                         )
-                        logger.info(f"[异步推理] 批量推理完成，处理了 {len(results)} 张图片")
+                        logger.info(f"[异步推理] 图片批量推理完成，处理了 {len(results)} 张图片")
 
                         stem_to_files = {}
                         for img_path in image_files:
@@ -5595,7 +6343,7 @@ def predict_with_model():
                             if stem not in stem_to_files:
                                 stem_to_files[stem] = []
                             stem_to_files[stem].append(img_path)
-                        
+
                         for stem, files in stem_to_files.items():
                             if len(files) > 1:
                                 logger.info(f"[异步推理] 检测到同名文件冲突: {[f.name for f in files]}，重新单独推理")
@@ -5608,7 +6356,6 @@ def predict_with_model():
                                         )
                                         if result and len(result) > 0:
                                             result_img = result[0].plot()
-                                            import cv2
                                             result_file = local_results_path / img_path.name
                                             cv2.imwrite(str(result_file), result_img)
                                             logger.debug(f"[异步推理] 单独保存结果: {img_path.name}")
@@ -5622,7 +6369,7 @@ def predict_with_model():
                                     if jpg_result.exists() and not png_result.exists():
                                         jpg_result.rename(png_result)
                                         logger.debug(f"[异步推理] 重命名结果: {jpg_result.name} -> {png_result.name}")
-                        
+
                     except Exception as e:
                         logger.error(f"[异步推理] 批量推理失败: {str(e)}")
                         logger.info(f"[异步推理] 降级为逐张处理模式")
@@ -5634,38 +6381,163 @@ def predict_with_model():
                                     save=False
                                 )
                                 if result and len(result) > 0:
-                                    import cv2
                                     result_img = result[0].plot()
                                     result_file = local_results_path / img_path.name
                                     cv2.imwrite(str(result_file), result_img)
                                 logger.debug(f"[异步推理] 完成: {img_path.name}")
                             except Exception as e2:
                                 logger.error(f"[异步推理] 推理失败 {img_path.name}: {str(e2)}")
-                
+                    finally:
+                        if image_only_dir.exists():
+                            safe_rmtree(image_only_dir)
+
+                seen_video_outputs = set()
+                ffmpeg_bin = shutil.which('ffmpeg')
+                if not ffmpeg_bin:
+                    logger.warning("[异步推理] 未检测到系统 ffmpeg，mp4 输出将回退到 OpenCV (mp4v/XVID)，无法生成 H.264")
+                for video_path in video_files:
+                    cap = None
+                    writer = None
+                    ffmpeg_proc = None
+                    try:
+                        logger.info(f"[异步推理] 开始处理视频: {video_path.name}")
+                        cap = cv2.VideoCapture(str(video_path))
+                        if not cap.isOpened():
+                            logger.error(f"[异步推理] 无法打开视频: {video_path.name}")
+                            continue
+
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.release()
+                        cap = None
+
+                        out_suffix = video_path.suffix.lower()
+                        if out_suffix in {'.mp4', '.m4v', '.mov'}:
+                            base_name = f"{video_path.stem}.mp4"
+                        else:
+                            base_name = f"{video_path.stem}.avi"
+
+                        output_name = base_name
+                        if output_name in seen_video_outputs:
+                            stem, ext = base_name.rsplit('.', 1)
+                            disambig = video_path.suffix.lstrip('.')
+                            candidate = f"{stem}_{disambig}.{ext}"
+                            counter = 1
+                            while candidate in seen_video_outputs:
+                                candidate = f"{stem}_{disambig}_{counter}.{ext}"
+                                counter += 1
+                            output_name = candidate
+                        seen_video_outputs.add(output_name)
+
+                        result_video_path = local_results_path / output_name
+
+                        is_mp4_family = out_suffix in {'.mp4', '.m4v', '.mov'}
+                        use_ffmpeg = bool(ffmpeg_bin) and is_mp4_family
+
+                        if use_ffmpeg:
+                            target_w = width - (width % 2)
+                            target_h = height - (height % 2)
+                            ffmpeg_proc = subprocess.Popen(
+                                [
+                                    ffmpeg_bin, '-y', '-loglevel', 'error',
+                                    '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                                    '-s', f'{target_w}x{target_h}',
+                                    '-pix_fmt', 'bgr24',
+                                    '-r', f'{fps}',
+                                    '-i', '-',
+                                    '-c:v', 'libx264',
+                                    '-pix_fmt', 'yuv420p',
+                                    '-preset', 'medium',
+                                    '-crf', '23',
+                                    '-movflags', '+faststart',
+                                    str(result_video_path),
+                                ],
+                                stdin=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                            )
+                        else:
+                            target_w, target_h = width, height
+                            if is_mp4_family:
+                                writer = cv2.VideoWriter(str(result_video_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                            else:
+                                writer = cv2.VideoWriter(str(result_video_path), cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+                            if not writer.isOpened():
+                                logger.error(f"[异步推理] 无法创建输出视频文件: {result_video_path}")
+                                continue
+
+                        frame_idx = 0
+                        for result in model.predict(source=str(video_path), conf=confidence, stream=True, save=False, verbose=False):
+                            annotated = result.plot()
+                            if annotated.shape[1] != target_w or annotated.shape[0] != target_h:
+                                annotated = cv2.resize(annotated, (target_w, target_h))
+                            if use_ffmpeg:
+                                try:
+                                    ffmpeg_proc.stdin.write(annotated.tobytes())
+                                except BrokenPipeError:
+                                    err_msg = ffmpeg_proc.stderr.read().decode('utf-8', errors='replace') if ffmpeg_proc.stderr else ''
+                                    logger.error(f"[异步推理] ffmpeg 编码中断: {err_msg}")
+                                    break
+                            else:
+                                writer.write(annotated)
+                            frame_idx += 1
+                            if total_frames and frame_idx % 100 == 0:
+                                logger.debug(f"[异步推理] {video_path.name} 已处理 {frame_idx}/{total_frames} 帧")
+
+                        logger.info(f"[异步推理] 视频处理完成: {video_path.name} -> {output_name}, 帧数={frame_idx}")
+                    except Exception as e:
+                        logger.error(f"[异步推理] 视频处理异常 {video_path.name}: {str(e)}")
+                    finally:
+                        if cap is not None:
+                            cap.release()
+                        if writer is not None:
+                            writer.release()
+                        if ffmpeg_proc is not None:
+                            try:
+                                if ffmpeg_proc.stdin:
+                                    ffmpeg_proc.stdin.close()
+                            except Exception:
+                                pass
+                            try:
+                                returncode = ffmpeg_proc.wait(timeout=60)
+                                if returncode != 0:
+                                    err_msg = ffmpeg_proc.stderr.read().decode('utf-8', errors='replace') if ffmpeg_proc.stderr else ''
+                                    logger.error(f"[异步推理] ffmpeg 退出码 {returncode}: {err_msg.strip()}")
+                            except subprocess.TimeoutExpired:
+                                ffmpeg_proc.kill()
+                                ffmpeg_proc.wait()
+                                logger.error(f"[异步推理] ffmpeg 超时被强制终止: {video_path.name}")
+
                 logger.info(f"[异步推理] 推理完成，结果保存到: {local_results_path}")
 
-                results_minio_dir = build_storage_minio_path('predict', model_id, prediction_id, 'results')
-                
-                actual_results_path = local_results_path
-                if actual_results_path.exists() and not any(actual_results_path.glob('*.jpg')) and not any(actual_results_path.glob('*.png')):
-                    subdirs = [d for d in actual_results_path.iterdir() if d.is_dir()]
-                    if subdirs:
-                        actual_results_path = subdirs[0]
+                results_storage_dir = build_storage_path('predict', model_id, prediction_id, 'results')
 
-                results_object_prefix = parse_storage_object_path(results_minio_dir)
+                actual_results_path = local_results_path
+                if actual_results_path.exists():
+                    has_result_files = any(
+                        f.is_file() and f.suffix.lower() in (DATASET_IMAGE_EXTENSIONS | DATASET_VIDEO_EXTENSIONS)
+                        for f in actual_results_path.iterdir()
+                    )
+                    if not has_result_files:
+                        subdirs = [d for d in actual_results_path.iterdir() if d.is_dir()]
+                        if subdirs:
+                            actual_results_path = subdirs[0]
+
+                results_object_prefix = parse_storage_relative_path(results_storage_dir)
                 delete_storage_prefix(results_object_prefix)
                 success_count, fail_count, failed_files = upload_directory_to_storage(
                     actual_results_path,
                     results_object_prefix
                 )
                 if fail_count:
-                    error_msg = f"上传推理结果到对象存储失败: fail_count={fail_count}, failed_files={failed_files[:5]}"
+                    error_msg = f"保存推理结果到本地工作区失败: fail_count={fail_count}, failed_files={failed_files[:5]}"
                     logger.error(f"[异步推理] {error_msg}")
                     predict_redis_manager.update_status(model_id, prediction_id, 'failed')
                     update_prediction_record(prediction_id, 'failed', error_msg)
                     return
 
-                logger.info(f"[异步推理] 结果已上传到对象存储: {results_minio_dir}, count={success_count}")
+                logger.info(f"[异步推理] 结果已保存到本地工作区: {results_storage_dir}, count={success_count}")
                 
                 predict_redis_manager.update_status(model_id, prediction_id, 'completed')
                 update_prediction_record(prediction_id, 'completed')
@@ -5674,7 +6546,6 @@ def predict_with_model():
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"[异步推理] 异常: {error_msg}")
-                import traceback
                 logger.error(traceback.format_exc())
                 predict_redis_manager.update_status(model_id, prediction_id, 'failed')
                 update_prediction_record(prediction_id, 'failed', error_msg)
@@ -5693,7 +6564,6 @@ def predict_with_model():
             
     except Exception as e:
         logger.error(f"预测接口错误: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         return jsonify({
             "code": 1,

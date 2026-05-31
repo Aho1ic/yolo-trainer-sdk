@@ -13,13 +13,6 @@ import sys
 from pathlib import Path
 import threading
 
-# 尝试导入MinIO客户端
-try:
-    from minio_client import get_minio_manager
-    MINIO_AVAILABLE = True
-except ImportError:
-    MINIO_AVAILABLE = False
-
 
 class DatasetSplitter:
     def __init__(self, original_train_data_address, train_val_ratio, dataset_id):
@@ -118,7 +111,7 @@ class DatasetSplitter:
             else:
                 self._copy_pair(img, val_images_dir, val_labels_dir)
         
-        # 这里不需要上传到MinIO，因为train_api.py会处理
+        # 数据复制由 train_api.py 处理
         # 只返回本地路径，让调用方决定如何处理
         return str(self.output_root.resolve())
 

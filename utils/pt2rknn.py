@@ -184,7 +184,7 @@ class ONNX2RKNN:
         
         Args:
             model_address: onnx模型的完整路径
-            duty_type: 任务类型，'detect' 或 'segment'
+            duty_type: 任务类型，'detect'、'segment' 或 'pose'
         """
         self.model_path = Path(model_address).resolve()
         self.duty_type = duty_type.lower()
@@ -197,15 +197,17 @@ class ONNX2RKNN:
             raise ValueError(f"模型文件必须是.onnx格式: {self.model_path}")
         
         # 验证duty_type参数
-        if self.duty_type not in ['detect', 'segment']:
-            raise ValueError(f"duty_type必须是 'detect' 或 'segment'，当前值: {self.duty_type}")
-        
+        if self.duty_type not in ['detect', 'segment', 'pose']:
+            raise ValueError(f"duty_type必须是 'detect'、'segment' 或 'pose'，当前值: {self.duty_type}")
+
         # 获取rknn_model_zoo目录路径
         self.base_dir = Path(__file__).parent.parent.resolve()
-        
+
         # 根据duty_type选择不同的convert.py路径
         if self.duty_type == 'detect':
             self.convert_script_path = self.base_dir / "rknn_model_zoo" / "examples" / "yolov8" / "python" / "convert.py"
+        elif self.duty_type == 'pose':
+            self.convert_script_path = self.base_dir / "rknn_model_zoo" / "examples" / "yolov8_pose" / "python" / "convert.py"
         else:  # segment
             self.convert_script_path = self.base_dir / "rknn_model_zoo" / "examples" / "yolov8_seg" / "python" / "convert.py"
         
@@ -294,7 +296,7 @@ class PT2RKNN:
         
         Args:
             model_address: pt模型的完整路径
-            duty_type: 任务类型，'detect' 或 'segment'
+            duty_type: 任务类型，'detect'、'segment' 或 'pose'
         """
         self.model_address = model_address
         self.duty_type = duty_type
@@ -347,8 +349,8 @@ def main():
     parser = argparse.ArgumentParser(description='将YOLOv8/YOLOv11的pt权重转换为onnx和rknn格式')
     parser.add_argument('--model_address', type=str, required=True, 
                         help='pt模型的完整路径')
-    parser.add_argument('--duty_type', type=str, choices=['detect', 'segment'], default='detect',
-                        help='任务类型: detect(目标检测) 或 segment(实例分割)')
+    parser.add_argument('--duty_type', type=str, choices=['detect', 'segment', 'pose'], default='detect',
+                        help='任务类型: detect(目标检测)、segment(实例分割) 或 pose(关键点检测)')
     parser.add_argument('--platform', type=str, default='rk3588',
                         help='目标平台，默认 rk3588')
     parser.add_argument('--dtype', type=str, default='i8', choices=['i8', 'u8', 'fp'],

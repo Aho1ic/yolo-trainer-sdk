@@ -6,11 +6,11 @@ A production-ready REST API platform for YOLOv8 model training, dataset manageme
 
 ## Features
 
-- **Model Training** - YOLOv8 object detection and instance segmentation with single/multi-GPU support
+- **Model Training** - YOLOv8 object detection, instance segmentation, and YOLO11 keypoint (pose) training with single/multi-GPU support
 - **Dataset Management** - JSON-to-TXT label conversion, YAML generation, label statistics, and batch label modification
 - **Model Conversion** - PT to ONNX/RKNN/BModel conversion for edge deployment (BM1684, BM1684X, RK3588)
 - **Task Management** - Start/stop training tasks, real-time progress monitoring via Redis
-- **Log Streaming** - Training logs uploaded to MinIO/RustFS in real-time
+- **Log Streaming** - Training logs written to the local data directory in real-time
 - **Connection Pooling** - SQLAlchemy-based database connection pool for high concurrency
 
 ## Architecture
@@ -35,9 +35,8 @@ trainer_v3/
 │   └── __init__.py
 ├── utils/
 │   ├── logger.py          # Unified logging
-│   ├── path_handler.py    # MinIO/local path resolution
-│   ├── minio_client.py    # MinIO/RustFS client
-│   ├── minio_log_uploader.py
+│   ├── path_handler.py    # Local path resolution
+│   ├── training_log_writer.py # Training log writer (writes to local data dir)
 │   ├── epoch_callback.py  # Training epoch callbacks
 │   ├── json2txt.py        # Label format converter
 │   ├── create_dataset_yaml.py
@@ -54,7 +53,7 @@ trainer_v3/
 - Python 3.9+
 - MySQL 5.7+
 - Redis 6.0+
-- MinIO or RustFS (S3-compatible object storage)
+- Local data directory (default `/data/Sucai1/algorithm/trainer`, configurable via `TRAINER_DATA_ROOT`)
 - CUDA-capable GPU (optional, for training)
 
 ### Installation
@@ -69,7 +68,7 @@ pip install -r requirements.txt
 
 # Copy and edit environment config
 cp .env.example .env
-# Edit .env with your database, MinIO, and Redis credentials
+# Edit .env with your database, Redis, and TRAINER_DATA_ROOT settings
 ```
 
 ### Configuration
@@ -101,7 +100,7 @@ The API server starts on `http://0.0.0.0:5000` by default.
 | POST | `/algorithm/datasets/yaml` | Generate dataset YAML config |
 | POST | `/algorithm/datasets/json2txt` | Convert JSON labels to TXT format |
 | POST | `/algorithm/datasets/create` | Create dataset with train/val split |
-| POST | `/algorithm/datasets/stats` | Get dataset statistics |
+| POST | `/algorithm/datasets/stats` | Get dataset statistics (skips when `train_dataset.original_dataset_hash` matches the current `original_dataset/{dataset_id}` directory hash) |
 | POST | `/algorithm/datasets/batch_modify_labels` | Batch rename/delete labels |
 | GET | `/algorithm/datasets/build_status` | Check dataset build status |
 | POST | `/algorithm/models/convert` | Convert PT model to target platform |
@@ -112,7 +111,7 @@ The API server starts on `http://0.0.0.0:5000` by default.
 - **Training**: Ultralytics YOLOv8
 - **Database**: MySQL (via pymysql + SQLAlchemy connection pool)
 - **Cache**: Redis
-- **Storage**: MinIO/RustFS (S3 API)
+- **Storage**: Local filesystem (`TRAINER_DATA_ROOT`)
 - **Model Export**: ONNX, RKNN, BModel (Sophon)
 
 ## License

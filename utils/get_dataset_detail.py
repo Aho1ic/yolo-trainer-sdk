@@ -14,28 +14,15 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 尝试导入MinIO客户端
 try:
-    from minio_client import get_minio_manager
-    MINIO_AVAILABLE = True
+    from .annotation_paths import resolve_annotation_dir
 except ImportError:
-    MINIO_AVAILABLE = False
+    from annotation_paths import resolve_annotation_dir
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # 并行处理的最大线程数
 MAX_WORKERS = 16
-
-
-def resolve_annotation_dir(base_dir: Path) -> Path:
-    """兼容 json/jsons 两种标注目录"""
-    for dir_name in ('json', 'jsons'):
-        candidate = base_dir / dir_name
-        if candidate.exists():
-            return candidate
-    return base_dir / 'json'
 
 class DatasetDetailAnalyzer:
     def __init__(self, original_train_data_address):
@@ -282,7 +269,7 @@ class DatasetDetailAnalyzer:
             with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             logger.info(f"分析结果已保存到: {result_file}")
-            # MinIO上传由调用方处理
+            # 文件复制由调用方处理
         except Exception as e:
             logger.error(f"保存分析结果失败: {str(e)}")
         
@@ -290,6 +277,7 @@ class DatasetDetailAnalyzer:
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     parser = argparse.ArgumentParser(description='数据集详情分析工具')
     parser.add_argument(
         '--original_train_data_address',

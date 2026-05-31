@@ -42,7 +42,7 @@ def validate_dataset_id(dataset_id: Any) -> int:
     if id_value <= 0:
         raise ValidationError(f"dataset_id 必须是正整数，收到: {id_value}")
 
-    if id_value > 2147483647:  # MySQL INT 上限
+    if id_value > 9223372036854775807:  # MySQL BIGINT 上限
         raise ValidationError(f"dataset_id 超出范围: {id_value}")
 
     return id_value
@@ -71,6 +71,40 @@ def validate_task_id(task_id: Any) -> int:
 
     if id_value <= 0:
         raise ValidationError(f"task_id 必须是正整数，收到: {id_value}")
+
+    return id_value
+
+
+def validate_positive_id(value: Any, field_name: str = "id") -> int:
+    """
+    验证并转换任意业务 ID 为正整数。
+
+    用于所有会参与文件系统路径拼接（mkdir / rmtree / 读写）的 ID，
+    防止 "../.." 等路径片段越权访问数据根目录之外的文件。
+
+    Args:
+        value: 要验证的 ID
+        field_name: 字段名称（用于错误信息）
+
+    Returns:
+        验证后的正整数
+
+    Raises:
+        ValidationError: 验证失败时抛出
+    """
+    if value is None:
+        raise ValidationError(f"{field_name} 不能为空")
+
+    try:
+        id_value = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field_name} 必须是整数，收到: {value}")
+
+    if id_value <= 0:
+        raise ValidationError(f"{field_name} 必须是正整数，收到: {id_value}")
+
+    if id_value > 9223372036854775807:  # MySQL BIGINT 上限
+        raise ValidationError(f"{field_name} 超出范围: {id_value}")
 
     return id_value
 

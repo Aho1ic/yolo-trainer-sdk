@@ -97,7 +97,8 @@ class DatabaseManager:
             # 回退到 pymysql 直连
             connection = None
             try:
-                connection = pymysql.connect(**self.config)
+                connect_config = {**self.config, 'connect_timeout': 10}
+                connection = pymysql.connect(**connect_config)
                 yield connection
                 connection.commit()
             except Exception:

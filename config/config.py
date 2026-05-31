@@ -7,23 +7,29 @@ import os
 import configparser
 from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-    DOTENV_AVAILABLE = True
-except ImportError:
-    DOTENV_AVAILABLE = False
-
 
 def _load_dotenv_file() -> None:
-    """加载 .env 文件（如果存在）"""
-    if not DOTENV_AVAILABLE:
-        return
+    """加载 .env 文件（如果存在）
 
-    # 从项目根目录查找 .env 文件
+    使用 setdefault：真实环境变量优先于 .env，保持
+    "环境变量 > .env > config.ini" 的优先级。
+    """
     project_root = Path(__file__).resolve().parents[1]
     env_file = project_root / '.env'
-    if env_file.exists():
-        load_dotenv(env_file, override=False)
+    if not env_file.exists():
+        return
+
+    with open(env_file, 'r', encoding='utf-8-sig') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ.setdefault(key, value)
 
 
 def _get_env(key: str, fallback=None, cast_type=None):
@@ -81,31 +87,13 @@ class TrainerConfig:
         self.max_concurrent_tasks = _get('max_concurrent_tasks', 'TRAINER_MAX_CONCURRENT_TASKS', fallback=5, cast_type=int)
         self.model_preload = _get('model_preload', 'TRAINER_MODEL_PRELOAD', fallback=False, cast_type=bool)
 
-        # MinIO配置
-        self.minio_endpoint = _get('minio_endpoint', 'TRAINER_MINIO_ENDPOINT', fallback='localhost:9000')
-        self.minio_access_key = _get('minio_access_key', 'TRAINER_MINIO_ACCESS_KEY', fallback='')
-        self.minio_secret_key = _get('minio_secret_key', 'TRAINER_MINIO_SECRET_KEY', fallback='')
-        self.minio_secure = _get('minio_secure', 'TRAINER_MINIO_SECURE', fallback=False, cast_type=bool)
-        self.minio_bucket = _get('minio_bucket', 'TRAINER_MINIO_BUCKET', fallback='algorithm')
-        self.minio_base_path = _get('minio_base_path', 'TRAINER_MINIO_BASE_PATH', fallback='trainer')
+        # 本地数据根目录
+        self.data_root = _get('data_root', 'TRAINER_DATA_ROOT', fallback='/data/Sucai1/training/algorithm/trainer')
 
-        # 对象存储本地工作区配置
-        self.object_storage_cache_root = _get(
-            'object_storage_cache_root',
-            'TRAINER_STORAGE_CACHE_ROOT',
-            fallback='/data/trainer_work'
-        )
-
-        # 兼容旧配置
-        self.object_storage_direct_read = _get(
-            'object_storage_direct_read',
-            'TRAINER_STORAGE_DIRECT_READ',
-            fallback=False,
-            cast_type=bool
-        )
-        self.object_storage_local_root = _get(
-            'object_storage_local_root',
-            'TRAINER_STORAGE_LOCAL_ROOT',
+        # 数据处理完成回调地址
+        self.process_callback_base_url = _get(
+            'process_callback_base_url',
+            'TRAINER_PROCESS_CALLBACK_BASE_URL',
             fallback=''
         )
 
@@ -126,17 +114,6 @@ class TrainerConfig:
             'charset': self.db_charset
         }
     
-    def get_minio_config(self):
-        """返回MinIO配置字典"""
-        return {
-            'endpoint': self.minio_endpoint,
-            'access_key': self.minio_access_key,
-            'secret_key': self.minio_secret_key,
-            'secure': self.minio_secure,
-            'bucket': self.minio_bucket,
-            'base_path': self.minio_base_path
-        }
-    
     def get_redis_config(self):
         """返回Redis配置字典"""
         return {
@@ -146,10 +123,10 @@ class TrainerConfig:
             'password': self.redis_password
         }
 
-    def get_storage_config(self):
-        """返回对象存储本地工作区配置字典"""
-        return {
-            'object_storage_cache_root': self.object_storage_cache_root,
-            'object_storage_direct_read': self.object_storage_direct_read,
-            'object_storage_local_root': self.object_storage_local_root
-        }
+    def get_data_root(self):
+        """返回本地数据根目录路径"""
+        return self.data_root
+
+    def get_process_callback_base_url(self):
+        """返回数据处理完成回调的基础地址"""
+        return self.process_callback_base_url

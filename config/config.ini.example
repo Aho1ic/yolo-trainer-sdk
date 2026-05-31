@@ -12,16 +12,11 @@ log_level = INFO
 max_concurrent_tasks = 5
 model_preload = false
 
-; RustFS对象存储配置
-minio_endpoint = localhost:9001
-minio_access_key = your_access_key
-minio_secret_key = your_secret_key
-minio_secure = false
-minio_bucket = algorithm
-minio_base_path = trainer
+; 本地数据根目录
+data_root = /data/Sucai1/algorithm/trainer
 
-; 对象存储本地工作区配置
-object_storage_cache_root = /data/trainer_work
+; 数据处理完成回调地址（uav-server 基础地址，代码会拼接 /system/trainTask/open/process-callback）
+process_callback_base_url = http://192.168.0.35:48080/admin-api
 
 ; Redis配置
 redis_host = localhost

@@ -31,8 +31,8 @@ class TrainingStoppedException(Exception):
     """训练被主动停止的异常"""
     pass
 
-# MinIO日志上传器
-from utils.minio_log_uploader import MinIOLogUploader
+# 训练日志写入器
+from utils.training_log_writer import TrainingLogWriter
 
 
 class EmojiFilter(logging.Filter):
@@ -67,9 +67,9 @@ class EmojiFilter(logging.Filter):
 class BaseLogHandler:
     """日志处理器基类，提供通用的日志处理逻辑"""
 
-    def __init__(self, terminal, log_uploader=None):
+    def __init__(self, terminal, log_writer=None):
         self.terminal = terminal
-        self.log_uploader = log_uploader
+        self.log_writer = log_writer
         self.line_buffer = ""
         self._written_keys = set()
         self._epoch_lines = {}
@@ -151,8 +151,8 @@ class BaseLogHandler:
                 epoch_num = int(line_key.split('_')[1])
                 self._epoch_lines[epoch_num] = line
 
-        if self.log_uploader:
-            self.log_uploader.write(line + '\n')
+        if self.log_writer:
+            self.log_writer.write(line + '\n')
 
     def flush(self):
         """刷新缓冲区"""
@@ -166,14 +166,14 @@ class BaseLogHandler:
 class StderrPassthrough(BaseLogHandler):
     """stderr处理类，同时输出到终端和日志（过滤警告信息，保留训练进度）"""
 
-    def __init__(self, terminal, log_uploader=None):
-        super().__init__(terminal, log_uploader)
+    def __init__(self, terminal, log_writer=None):
+        super().__init__(terminal, log_writer)
 
     def write(self, message):
         """写入终端，如果有log_uploader也写入日志"""
         self.terminal.write(message)
 
-        if self.log_uploader and message:
+        if self.log_writer and message:
             clean_msg = self._clean_ansi(message)
             if not clean_msg:
                 return
@@ -206,15 +206,15 @@ class StderrPassthrough(BaseLogHandler):
 
 
 class DualOutput(BaseLogHandler):
-    """同时输出到MinIO上传器和终端的类，保留YOLO默认日志格式"""
+    """同时输出到日志写入器和终端的类，保留YOLO默认日志格式"""
 
-    def __init__(self, log_uploader, terminal):
-        super().__init__(terminal, log_uploader)
+    def __init__(self, log_writer, terminal):
+        super().__init__(terminal, log_writer)
         self.emoji_filter = EmojiFilter()
         self._last_flush_time = 0
 
     def write(self, message):
-        """写入消息到MinIO上传器和终端"""
+        """写入消息到日志写入器和终端"""
         self.terminal.write(message)
 
         if not message:
@@ -276,10 +276,10 @@ class DualOutput(BaseLogHandler):
             line = self.line_buffer.strip()
             if line and '100%' in line:
                 line = self._beautify_progress_bar(line)
-                self.log_uploader.write(line + '\n')
+                self.log_writer.write(line + '\n')
             self.line_buffer = ""
         self.terminal.flush()
-        self.log_uploader.flush()
+        self.log_writer.flush()
 
 
 class YOLOv8Trainer:
@@ -291,23 +291,24 @@ class YOLOv8Trainer:
         初始化训练器
         
         Args:
-            task_id: 训练任务ID，用于MinIO日志上传路径
+            task_id: 训练任务ID，用于训练日志写入路径
             db_manager: 数据库管理器实例（用于epoch回调更新数据库）
             redis_manager: Redis管理器实例（用于实时更新训练进度）
         """
         self.task_id = task_id
         self.db_manager = db_manager
         self.redis_manager = redis_manager
-        self.log_uploader: Optional[MinIOLogUploader] = None
-        self.epoch_uploader: Optional['EpochMinIOUploader'] = None
+        self.log_writer: Optional[TrainingLogWriter] = None
+        self.epoch_callback: Optional['TrainingEpochCallback'] = None
         self.logger = self._setup_logging()
         self.default_params = self._get_default_params()
         self.stop_event = threading.Event()
         self.training_stopped = False
         self.model_trainer = None
+        self.total_epochs: Optional[int] = None
     
     def _setup_logging(self):
-        """设置日志记录（仅控制台输出，日志通过MinIO上传）"""
+        """设置日志记录（仅控制台输出，日志写入本地数据目录）"""
         # 创建专属logger
         logger_name = f"trainer_{os.getpid()}_{threading.get_ident()}"
         logger = logging.getLogger(logger_name)
@@ -350,7 +351,7 @@ class YOLOv8Trainer:
         yolo_logger.addHandler(console_handler)
     
     def _setup_output_redirection(self, device='0'):
-        """设置输出重定向，捕获所有stdout和stderr输出到MinIO上传器
+        """设置输出重定向，捕获所有 stdout 和 stderr 输出到日志写入器
         
         Args:
             device: 训练设备，如 '0', '1', '0,1' 等
@@ -366,24 +367,24 @@ class YOLOv8Trainer:
             # 多GPU模式：DDP会spawn子进程，stdout重定向在子进程中无效
             # 创建日志上传器，但不重定向stdout/stderr
             # 日志将通过监控YOLO输出目录中的results.csv文件来生成
-            self.log_uploader = MinIOLogUploader(self.task_id, upload_interval=0.5)
-            self.log_uploader.start()
+            self.log_writer = TrainingLogWriter(self.task_id, flush_interval=0.5)
+            self.log_writer.start()
             self.logger.info(f"多GPU模式(device={device})：使用CSV监控方式生成日志")
             
             # 启动CSV监控线程来生成日志（而不是监控training.log）
             self._start_csv_log_monitor()
         else:
             # 单GPU模式：使用stdout重定向
-            self.log_uploader = MinIOLogUploader(self.task_id, upload_interval=0.5)
-            self.log_uploader.start()
+            self.log_writer = TrainingLogWriter(self.task_id, flush_interval=0.5)
+            self.log_writer.start()
             
             # 保存原始的stdout和stderr
             self.original_stdout = sys.stdout
             self.original_stderr = sys.stderr
             
             # 创建双重输出对象（stdout和stderr都写入日志）
-            self.dual_stdout = DualOutput(self.log_uploader, self.original_stdout)
-            self.dual_stderr = StderrPassthrough(self.original_stderr, self.log_uploader)
+            self.dual_stdout = DualOutput(self.log_writer, self.original_stdout)
+            self.dual_stderr = StderrPassthrough(self.original_stderr, self.log_writer)
             
             # 重定向stdout和stderr
             sys.stdout = self.dual_stdout
@@ -414,11 +415,12 @@ class YOLOv8Trainer:
             
             # 监控results.csv文件
             results_csv_path = Path(
-                PathHandler.resolve_storage_local_path('train_results', self.task_id, 'results.csv', require_exists=False)
+                PathHandler.resolve_local_path('train_results', self.task_id, 'results.csv', require_exists=False)
             )
             last_line_count = 0
             header_written = False
-            total_epochs = None
+            # 优先使用训练参数中传入的真实总轮数，避免被 CSV 推断逻辑污染
+            total_epochs = self.total_epochs if self.total_epochs else None
             last_epoch_time = None
             epoch_start_time = time.time()
             
@@ -426,10 +428,10 @@ class YOLOv8Trainer:
                 try:
                     # 写入训练开始信息（只写一次）
                     if not header_written:
-                        self.log_uploader.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - YOLOv8训练开始\n")
-                        self.log_uploader.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - 多GPU训练模式 (DDP)\n")
-                        self.log_uploader.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Task ID: {self.task_id}\n")
-                        self.log_uploader.write("\n")
+                        self.log_writer.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - YOLOv8训练开始\n")
+                        self.log_writer.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - 多GPU训练模式 (DDP)\n")
+                        self.log_writer.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Task ID: {self.task_id}\n")
+                        self.log_writer.write("\n")
                         header_written = True
                     
                     if results_csv_path.exists():
@@ -448,9 +450,12 @@ class YOLOv8Trainer:
                                         epoch = int(row.get('epoch', 0))
                                         epoch_time = float(row.get('time', 0)) if row.get('time') else 0
                                         
-                                        # 从第一行推断总epochs（假设最后一行是最大epoch）
-                                        if total_epochs is None or epoch > total_epochs:
-                                            total_epochs = max(epoch, 100)  # 至少100
+                                        # 优先使用训练参数中的真实总轮数，避免日志一直显示 **/100
+                                        if self.total_epochs:
+                                            total_epochs = self.total_epochs
+                                        elif total_epochs is None or epoch > total_epochs:
+                                            # 兜底：仅在拿不到真实参数时，按当前 epoch 推断
+                                            total_epochs = epoch
                                         
                                         # 计算每个epoch的耗时
                                         if last_epoch_time is not None and epoch_time > 0:
@@ -495,38 +500,38 @@ class YOLOv8Trainer:
                                             mAP50_95_f = float(mAP50_95)
                                             
                                             # 第1行: Epoch表头（每轮都输出）
-                                            self.log_uploader.write("      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size\n")
+                                            self.log_writer.write("      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size\n")
                                             
                                             # 第2行: epoch训练数据行（含进度条）
                                             epoch_line = f"{epoch}/{total_epochs}      3.35G    {box_loss_f:.4f}    {cls_loss_f:.4f}    {dfl_loss_f:.4f}        -      640: 100%|██████████| [{time_str}, {speed}]\n"
-                                            self.log_uploader.write(epoch_line)
+                                            self.log_writer.write(epoch_line)
                                             
                                             # 第3行: Class验证表头行（含进度条）
                                             class_line = f"Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| [{time_str}, {speed}]\n"
-                                            self.log_uploader.write(class_line)
+                                            self.log_writer.write(class_line)
                                             
                                             # 第4行: all验证结果行
                                             val_line = f"                   all          {images_count}          {instances_count}    {precision_f:.3f}          {recall_f:.3f}      {mAP50_f:.3f}      {mAP50_95_f:.3f}\n"
-                                            self.log_uploader.write(val_line)
+                                            self.log_writer.write(val_line)
                                             
                                         except (ValueError, TypeError) as e:
                                             # 数值转换失败时记录错误
-                                            self.log_uploader.write(f"# Epoch {epoch} 数据解析错误: {str(e)}\n")
+                                            self.log_writer.write(f"# Epoch {epoch} 数据解析错误: {str(e)}\n")
                                         
                                 except Exception as e:
-                                    pass  # 忽略解析错误
+                                    self.logger.debug(f"CSV日志监控解析行失败: {e}")
                             
                             last_line_count = current_line_count
                 
                 except Exception as e:
-                    pass  # 忽略监控错误，继续运行
+                    self.logger.debug(f"CSV日志监控循环出错: {e}")
                 
                 # 每2秒检查一次
                 self._log_monitor_stop_event.wait(2)
             
             # 监控结束时写入完成信息
             if header_written:
-                self.log_uploader.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - 训练完成\n")
+                self.log_writer.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - 训练完成\n")
         
         self._log_monitor_thread = threading.Thread(
             target=monitor_csv_files,
@@ -535,220 +540,6 @@ class YOLOv8Trainer:
         )
         self._log_monitor_thread.start()
         self.logger.info(f"CSV日志监控线程已启动: task_id={self.task_id}")
-    
-    def _start_log_file_monitor(self):
-        """启动日志文件监控线程（用于多GPU模式）
-        
-        监控YOLO训练输出目录中的training.log文件，并将内容写入MinIO上传器
-        添加过滤机制，去除不需要的日志内容
-        """
-        import threading
-        
-        self._log_monitor_stop_event = threading.Event()
-        
-        def monitor_log_files():
-            """监控日志文件的线程函数"""
-            import time
-            from pathlib import Path
-            from datetime import datetime
-            
-            # 监控training.log文件
-            training_log_path = Path(
-                PathHandler.resolve_storage_local_path('train_log', self.task_id, 'training.log', require_exists=False)
-            )
-            last_position = 0
-            header_written = False
-            
-            # 用于去重的集合和字典
-            written_line_hashes = set()  # 存储已写入行的hash
-            epoch_written = set()  # 已写入的epoch号
-            scan_train_written = False
-            scan_val_written = False
-            epoch_header_written = False
-            class_header_count = 0  # Class表头计数（每个epoch一次）
-            
-            # 过滤规则
-            def should_filter(line):
-                """判断是否应该过滤该行"""
-                line_stripped = line.strip()
-                if not line_stripped:
-                    return True
-                
-                # 过滤matplotlib字体警告
-                if 'UserWarning' in line and 'Glyph' in line:
-                    return True
-                if 'missing from font' in line:
-                    return True
-                if 'plt.savefig' in line:
-                    return True
-                
-                # 过滤Python路径警告
-                if '/site-packages/' in line and 'Warning' in line:
-                    return True
-                
-                # 过滤纯百分比行
-                if re.match(r'^\s*\d+%\s*$', line_stripped):
-                    return True
-                
-                # 过滤空的进度条行
-                if re.match(r'^\s*\|+\s*$', line_stripped):
-                    return True
-                
-                # 过滤DDP相关的冗余信息
-                if 'DDP' in line and 'rank' in line.lower() and 'initialized' not in line.lower():
-                    return True
-                
-                # 过滤torch分布式的调试信息
-                if 'torch.distributed' in line and 'DEBUG' in line:
-                    return True
-                
-                # 过滤NCCL相关的调试信息
-                if 'NCCL' in line and ('INFO' in line or 'DEBUG' in line):
-                    return True
-                
-                # 过滤未完成的进度条（只保留100%完成的）
-                if '|' in line and '%' in line and '100%' not in line:
-                    progress_match = re.search(r'\|\s*(\d+)/(\d+)\s*\[', line)
-                    if progress_match:
-                        current = int(progress_match.group(1))
-                        total = int(progress_match.group(2))
-                        if current != total:
-                            return True
-                    else:
-                        # 没有匹配到完成标记，过滤
-                        return True
-                
-                return False
-            
-            def clean_line(line):
-                """清理行内容"""
-                # 去除ANSI转义序列
-                line = re.sub(r'\x1B[@-_][0-?]*[ -/]*[@-~]', '', line)
-                # 去除表情符号
-                line = re.sub(
-                    "[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
-                    "\U0001F700-\U0001F77F\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF"
-                    "\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF"
-                    "\U00002702-\U000027B0\U000024C2-\U0001F251]+", '', line
-                )
-                # 美化进度条
-                line = re.sub(r'100%\|[#█\d\s]+\|', '100%|██████████|', line)
-                return line.rstrip()
-            
-            def should_dedupe(line):
-                """判断是否应该去重该行，返回 (should_skip, line_key)"""
-                nonlocal scan_train_written, scan_val_written, epoch_header_written, class_header_count
-                
-                line_stripped = line.strip()
-                
-                # train扫描行（只保留一次）
-                if 'Scanning' in line and 'train' in line.lower() and ('images' in line or 'cache' in line):
-                    if scan_train_written:
-                        return True, 'scan_train'
-                    scan_train_written = True
-                    return False, 'scan_train'
-                
-                # val扫描行（只保留一次）
-                if 'Scanning' in line and 'val' in line.lower() and ('images' in line or 'cache' in line):
-                    if scan_val_written:
-                        return True, 'scan_val'
-                    scan_val_written = True
-                    return False, 'scan_val'
-                
-                # Epoch表头行（只保留一次）
-                if line_stripped.startswith('Epoch') and 'GPU_mem' in line:
-                    if epoch_header_written:
-                        return True, 'epoch_header'
-                    epoch_header_written = True
-                    return False, 'epoch_header'
-                
-                # epoch训练行（每个epoch只保留一次）
-                epoch_match = re.match(r'\s*(\d+)/(\d+)\s+[\d.]+G', line_stripped)
-                if epoch_match:
-                    epoch_num = epoch_match.group(1)
-                    if epoch_num in epoch_written:
-                        return True, f'epoch_{epoch_num}'
-                    epoch_written.add(epoch_num)
-                    return False, f'epoch_{epoch_num}'
-                
-                # Class验证标题行（每个epoch保留一次，通过计数控制）
-                if line_stripped.startswith('Class') and 'Images' in line and 'Instances' in line:
-                    expected_count = len(epoch_written)
-                    if class_header_count >= expected_count:
-                        return True, 'class_header'
-                    class_header_count += 1
-                    return False, 'class_header'
-                
-                # all验证结果行（使用内容hash去重）
-                if re.match(r'\s*all\s+\d+', line_stripped):
-                    line_hash = hash(line_stripped)
-                    if line_hash in written_line_hashes:
-                        return True, f'all_{line_hash}'
-                    written_line_hashes.add(line_hash)
-                    return False, f'all_{line_hash}'
-                
-                # 其他行不去重
-                return False, None
-            
-            while not self._log_monitor_stop_event.is_set():
-                try:
-                    if training_log_path.exists():
-                        # 写入表头（只写一次）
-                        if not header_written:
-                            self.log_uploader.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - YOLOv8训练开始\n")
-                            self.log_uploader.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - 多GPU训练模式 (DDP)\n")
-                            self.log_uploader.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Task ID: {self.task_id}\n")
-                            self.log_uploader.write("\n")
-                            header_written = True
-                        
-                        # 读取新增内容
-                        with open(training_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            f.seek(last_position)
-                            new_content = f.read()
-                            last_position = f.tell()
-                        
-                        if new_content:
-                            for line in new_content.split('\n'):
-                                # 清理行
-                                cleaned_line = clean_line(line)
-                                
-                                if not cleaned_line:
-                                    continue
-                                
-                                # 过滤
-                                if should_filter(cleaned_line):
-                                    continue
-                                
-                                # 去重
-                                skip, _ = should_dedupe(cleaned_line)
-                                if skip:
-                                    continue
-                                
-                                # 写入日志
-                                self.log_uploader.write(cleaned_line + '\n')
-                    
-                    else:
-                        # 日志文件不存在，尝试创建目录
-                        training_log_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                except Exception as e:
-                    pass  # 忽略监控错误，继续运行
-                
-                # 每1秒检查一次
-                self._log_monitor_stop_event.wait(1)
-            
-            # 监控结束时写入完成信息
-            if header_written:
-                self.log_uploader.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - 训练完成\n")
-        
-        self._log_monitor_thread = threading.Thread(
-            target=monitor_log_files,
-            name=f"LogMonitor-{self.task_id}",
-            daemon=True
-        )
-        self._log_monitor_thread.start()
-        self.logger.info(f"日志文件监控线程已启动: task_id={self.task_id}")
-    
     
     def stop_training(self):
         """停止当前正在进行的训练"""
@@ -815,7 +606,8 @@ class YOLOv8Trainer:
             'patience': 0,
             'save_period': -1,
             'workers': 8,
-            'resume': ''
+            'resume': '',
+            'kpt_num': 0,
         }
 
     def _normalize_dataset_entries(self, entry):
@@ -834,9 +626,17 @@ class YOLOv8Trainer:
             return entry_path
         return (dataset_root / entry_path).resolve()
 
-    def _scan_label_file(self, label_path: Path, task_type: str, class_count: Optional[int]):
+    def _scan_label_file(self, label_path: Path, task_type: str, class_count: Optional[int],
+                         kpt_num: Optional[int] = None):
         """检查单个标签文件是否包含至少一条有效标注"""
-        min_fields = 5 if task_type == 'detect' else 7
+        if task_type == 'detect':
+            min_fields = 5
+        elif task_type == 'pose':
+            # class + bbox(4) + K * (x,y,v)
+            expected = 5 + 3 * int(kpt_num or 0)
+            min_fields = expected if expected > 5 else 5
+        else:
+            min_fields = 7
         issues = []
         has_valid_annotation = False
 
@@ -867,6 +667,16 @@ class YOLOv8Trainer:
                         if len(coords) != 4:
                             issues.append(f"{label_path.name}:{line_no} 检测标签应为 5 列")
                             continue
+                    elif task_type == 'pose':
+                        if not kpt_num or kpt_num <= 0:
+                            issues.append(f"{label_path.name}:{line_no} pose 任务缺少 kpt_num 配置")
+                            continue
+                        expected_kpt_cols = 4 + 3 * int(kpt_num)
+                        if len(coords) != expected_kpt_cols:
+                            issues.append(
+                                f"{label_path.name}:{line_no} pose 标签列数应为 {1 + expected_kpt_cols}"
+                            )
+                            continue
                     else:
                         if len(coords) < 6 or len(coords) % 2 != 0:
                             issues.append(f"{label_path.name}:{line_no} 分割标签点数非法")
@@ -880,7 +690,7 @@ class YOLOv8Trainer:
         return has_valid_annotation, issues
 
     def _inspect_dataset_split(self, split_name: str, entries, dataset_root: Path, task_type: str,
-                               class_count: Optional[int]):
+                               class_count: Optional[int], kpt_num: Optional[int] = None):
         """检查单个数据集切分的目录、图片和标签情况"""
         errors = []
         image_count = 0
@@ -927,7 +737,9 @@ class YOLOv8Trainer:
                     continue
 
                 matched_pairs += 1
-                has_valid_annotation, issues = self._scan_label_file(label_path, task_type, class_count)
+                has_valid_annotation, issues = self._scan_label_file(
+                    label_path, task_type, class_count, kpt_num=kpt_num
+                )
                 if has_valid_annotation:
                     valid_label_files += 1
                 elif issues and len(invalid_issue_samples) < 3:
@@ -972,6 +784,19 @@ class YOLOv8Trainer:
         elif isinstance(names, dict):
             class_count = len(names)
 
+        # pose 任务从 yaml 中读取 kpt_shape，作为 _scan_label_file 的列数校验依据
+        kpt_num = None
+        if task_type == 'pose':
+            kpt_shape = data_config.get('kpt_shape')
+            if isinstance(kpt_shape, (list, tuple)) and len(kpt_shape) >= 1:
+                try:
+                    kpt_num = int(kpt_shape[0])
+                except (TypeError, ValueError):
+                    kpt_num = None
+            if not kpt_num or kpt_num <= 0:
+                self.logger.error("pose 任务的 dataset.yaml 缺少有效的 kpt_shape")
+                return False
+
         dataset_errors = []
         dataset_errors.extend(
             self._inspect_dataset_split(
@@ -980,6 +805,7 @@ class YOLOv8Trainer:
                 dataset_root=dataset_root,
                 task_type=task_type,
                 class_count=class_count,
+                kpt_num=kpt_num,
             )
         )
         dataset_errors.extend(
@@ -989,6 +815,7 @@ class YOLOv8Trainer:
                 dataset_root=dataset_root,
                 task_type=task_type,
                 class_count=class_count,
+                kpt_num=kpt_num,
             )
         )
 
@@ -1070,49 +897,64 @@ class YOLOv8Trainer:
                 model_path = args['incremental_model_address']
                 self.logger.info(f"增量训练模式，使用模型: {model_path}")
                 return model_path
-            
+
             script_dir = Path(__file__).parent.parent  # trainer目录
             pre_model_dir = script_dir / "pre_model"
-            
+
             if args['dutyType'] == 'detect':
                 model_name = f"yolov8{args['model_size']}.pt"
+                fallback_name = "yolov8n.pt"
             elif args['dutyType'] == 'segment':
                 model_name = f"yolov8{args['model_size']}-seg.pt"
+                fallback_name = "yolov8n-seg.pt"
+            elif args['dutyType'] == 'pose':
+                # pose 模型采用 yolo11{size}-pose.pt
+                model_name = f"yolo11{args['model_size']}-pose.pt"
+                fallback_name = "yolo11n-pose.pt"
             else:
                 raise ValueError(f"不支持的dutyType: {args['dutyType']}")
-            
+
             model_path = pre_model_dir / model_name
-            
+
             if not model_path.exists():
                 self.logger.error(f"预训练模型不存在: {model_path}")
-                fallback_model = pre_model_dir / "yolov8n.pt"
+                fallback_model = pre_model_dir / fallback_name
                 if fallback_model.exists():
                     self.logger.warning(f"使用备用模型: {fallback_model}")
                     return str(fallback_model)
                 else:
                     raise FileNotFoundError(f"模型文件不存在且无备用模型: {model_path}")
-            
+
             self.logger.info(f"自动选择模型: {model_path}")
             return str(model_path)
-            
+
         except Exception as e:
             self.logger.error(f"模型选择失败: {str(e)}")
             raise
     
-    def train_detection(self, args):
-        """执行目标检测训练"""
+    def _run_training(self, args, task_label: str, ultra_task: Optional[str] = None):
+        """通用训练执行方法，detect/segment/pose 共用
+
+        Args:
+            args: 训练参数
+            task_label: 任务中文标签（用于日志）
+            ultra_task: 显式传入 Ultralytics 的 task 名称（pose 必填）
+        """
+        model = None
         try:
-            self.logger.info("开始初始化YOLOv8目标检测模型...")
-            
+            self.logger.info(f"开始初始化YOLOv8{task_label}模型...")
+
             if args['resume']:
                 self.logger.info(f"从检查点恢复训练: {args['resume']}")
                 model = YOLO(args['resume'])
             else:
-                # 自动选择模型
                 selected_model = self.select_model_path(args)
                 self.logger.info(f"加载预训练模型: {selected_model}")
-                model = YOLO(selected_model)
-            
+                if ultra_task:
+                    model = YOLO(selected_model, task=ultra_task)
+                else:
+                    model = YOLO(selected_model)
+
             train_args = {
                 'data': args['yaml'],
                 'epochs': args['epoch'],
@@ -1133,173 +975,81 @@ class YOLOv8Trainer:
                 'patience': args['patience'],
                 'save_period': args['save_period'],
                 'workers': args['workers'],
-                'verbose': False,  # 减少YOLO的详细输出
+                'verbose': False,
                 'save': True,
                 'plots': True,
                 'val': True
             }
-            
-            # 简化日志输出，只记录关键信息
-            self.logger.info(f"目标检测配置: 数据集={train_args['data']}, Epochs={train_args['epochs']}, Batch={train_args['batch']}")
-            
+
+            # pose 任务显式声明 task，避免被预训练权重的默认 task 误判
+            if ultra_task:
+                train_args['task'] = ultra_task
+
+            self.logger.info(f"{task_label}配置: 数据集={train_args['data']}, Epochs={train_args['epochs']}, Batch={train_args['batch']}")
+
             # 添加停止回调
-            stop_callbacks = self._create_stop_callback()
-            for callback_name, callback_func in stop_callbacks.items():
-                model.add_callback(callback_name, callback_func)
-            
-            # 添加Epoch MinIO上传回调
+            for cb_name, cb_func in self._create_stop_callback().items():
+                model.add_callback(cb_name, cb_func)
+
+            # 添加 Epoch 训练回调
             if self.task_id:
                 try:
-                    from utils.epoch_callback import EpochMinIOUploader
+                    from utils.epoch_callback import TrainingEpochCallback
                     output_dir = Path(train_args['project']) / train_args['name']
-                    self.epoch_uploader = EpochMinIOUploader(self.task_id, output_dir, self.db_manager, self.redis_manager)
-                    model.add_callback('on_train_epoch_end', self.epoch_uploader.on_train_epoch_end)
-                    self.logger.info(f"已添加Epoch MinIO上传回调: {output_dir}")
+                    self.epoch_callback = TrainingEpochCallback(self.task_id, output_dir, self.db_manager, self.redis_manager)
+                    model.add_callback('on_train_epoch_end', self.epoch_callback.on_train_epoch_end)
+                    self.logger.info(f"已添加 Epoch 训练回调: {output_dir}")
                 except Exception as e:
                     self.logger.warning(f"添加Epoch回调失败: {e}")
-            
-            self.logger.info("开始目标检测训练...")
+
+            self.logger.info(f"开始{task_label}训练...")
             results = model.train(**train_args)
-            
-            # 保存trainer引用以便停止
+
             self.model_trainer = model.trainer if hasattr(model, 'trainer') else None
-            
-            # 检查是否被主动停止
+
             if self.training_stopped and self.stop_event.is_set():
-                self.logger.info("目标检测训练已被主动停止!")
-                return False
+                self.logger.info(f"{task_label}训练已被主动停止!")
+                return 'stopped'
             else:
-                self.logger.info("目标检测训练完成!")
-            
+                self.logger.info(f"{task_label}训练完成!")
+
             if hasattr(model, 'trainer') and model.trainer:
                 self.logger.info(f"最佳模型保存路径: {model.trainer.best}")
                 self.logger.info(f"最后模型保存路径: {model.trainer.last}")
-                # 保存模型路径以供外部访问
                 self.best_model_path = model.trainer.best
                 self.last_model_path = model.trainer.last
-            
+
             if hasattr(results, 'results_dict'):
                 self.logger.info("训练结果:")
                 for metric, value in results.results_dict.items():
                     self.logger.info(f"  {metric}: {value}")
-            
+
             return True
-            
+
         except TrainingStoppedException as e:
-            # 训练被主动停止，标记为已停止（不是失败）
-            self.logger.info(f"目标检测训练已被主动停止: {str(e)}")
+            self.logger.info(f"{task_label}训练已被主动停止: {str(e)}")
             self.training_stopped = True
-            # 保存已训练的模型路径（如果有的话）
-            if hasattr(model, 'trainer') and model.trainer:
+            if model and hasattr(model, 'trainer') and model.trainer:
                 self.best_model_path = getattr(model.trainer, 'best', None)
                 self.last_model_path = getattr(model.trainer, 'last', None)
                 if self.best_model_path:
                     self.logger.info(f"停止时保存的最佳模型: {self.best_model_path}")
-            return 'stopped'  # 返回特殊标识表示被主动停止
+            return 'stopped'
         except Exception as e:
-            self.logger.error(f"目标检测训练过程中发生错误: {str(e)}")
+            self.logger.error(f"{task_label}训练过程中发生错误: {str(e)}")
             return False
-    
+
+    def train_detection(self, args):
+        """执行目标检测训练"""
+        return self._run_training(args, "目标检测")
+
     def train_segmentation(self, args):
         """执行实例分割训练"""
-        try:
-            self.logger.info("开始初始化YOLOv8实例分割模型...")
-            
-            if args['resume']:
-                self.logger.info(f"从检查点恢复训练: {args['resume']}")
-                model = YOLO(args['resume'])
-            else:
-                # 自动选择分割模型
-                selected_model = self.select_model_path(args)
-                self.logger.info(f"加载预训练分割模型: {selected_model}")
-                model = YOLO(selected_model)
-            
-            train_args = {
-                'data': args['yaml'],
-                'epochs': args['epoch'],
-                'batch': args['batch'],
-                'imgsz': args['imgsz'],
-                'device': args['device'],
-                'project': args['project'],
-                'name': args['name'],
-                'lr0': args['lr0'],
-                'lrf': args['lrf'],
-                'cos_lr': args['cos_lr'],
-                'warmup_epochs': args['warmup_epochs'],
-                'warmup_bias_lr': args['warmup_bias_lr'],
-                'momentum': args['momentum'],
-                'weight_decay': args['weight_decay'],
-                'fliplr': args['fliplr'],
-                'amp': args['amp'],
-                'patience': args['patience'],
-                'save_period': args['save_period'],
-                'workers': args['workers'],
-                'verbose': False,  # 减少YOLO的详细输出
-                'save': True,
-                'plots': True,
-                'val': True
-            }
-            
-            # 简化日志输出，只记录关键信息
-            self.logger.info(f"实例分割配置: 数据集={train_args['data']}, Epochs={train_args['epochs']}, Batch={train_args['batch']}")
+        return self._run_training(args, "实例分割")
 
-            # 添加停止回调
-            stop_callbacks = self._create_stop_callback()
-            for callback_name, callback_func in stop_callbacks.items():
-                model.add_callback(callback_name, callback_func)
-            
-            # 添加Epoch MinIO上传回调
-            if self.task_id:
-                try:
-                    from utils.epoch_callback import EpochMinIOUploader
-                    output_dir = Path(train_args['project']) / train_args['name']
-                    self.epoch_uploader = EpochMinIOUploader(self.task_id, output_dir, self.db_manager, self.redis_manager)
-                    model.add_callback('on_train_epoch_end', self.epoch_uploader.on_train_epoch_end)
-                    self.logger.info(f"已添加Epoch MinIO上传回调: {output_dir}")
-                except Exception as e:
-                    self.logger.warning(f"添加Epoch回调失败: {e}")
-            
-            self.logger.info("开始实例分割训练...")
-            results = model.train(**train_args)
-            
-            # 保存trainer引用以便停止
-            self.model_trainer = model.trainer if hasattr(model, 'trainer') else None
-
-            # 检查是否被主动停止
-            if self.training_stopped and self.stop_event.is_set():
-                self.logger.info("实例分割训练已被主动停止!")
-                return False
-            else:
-                self.logger.info("实例分割训练完成!")
-            
-            if hasattr(model, 'trainer') and model.trainer:
-                self.logger.info(f"最佳模型保存路径: {model.trainer.best}")
-                self.logger.info(f"最后模型保存路径: {model.trainer.last}")
-                # 保存模型路径以供外部访问
-                self.best_model_path = model.trainer.best
-                self.last_model_path = model.trainer.last
-
-            if hasattr(results, 'results_dict'):
-                self.logger.info("训练结果:")
-                for metric, value in results.results_dict.items():
-                    self.logger.info(f"  {metric}: {value}")
-            
-            return True
-            
-        except TrainingStoppedException as e:
-            # 训练被主动停止，标记为已停止（不是失败）
-            self.logger.info(f"实例分割训练已被主动停止: {str(e)}")
-            self.training_stopped = True
-            # 保存已训练的模型路径（如果有的话）
-            if hasattr(model, 'trainer') and model.trainer:
-                self.best_model_path = getattr(model.trainer, 'best', None)
-                self.last_model_path = getattr(model.trainer, 'last', None)
-                if self.best_model_path:
-                    self.logger.info(f"停止时保存的最佳模型: {self.best_model_path}")
-            return 'stopped'  # 返回特殊标识表示被主动停止
-        except Exception as e:
-            self.logger.error(f"实例分割训练过程中发生错误: {str(e)}")
-            return False
+    def train_pose(self, args):
+        """执行关键点(pose)训练"""
+        return self._run_training(args, "关键点", ultra_task='pose')
     
     def train(self, **kwargs):
         """
@@ -1314,8 +1064,14 @@ class YOLOv8Trainer:
         # 合并参数
         args = self.default_params.copy()
         args.update(kwargs)
-        
-        # 设置输出重定向（启动MinIO日志上传），传入device参数以检测多GPU模式
+
+        # 记录训练总轮数，供日志监控线程使用，避免被硬编码下限覆盖
+        try:
+            self.total_epochs = int(args.get('epoch', 0)) or None
+        except (TypeError, ValueError):
+            self.total_epochs = None
+
+        # 设置输出重定向（启动日志写入），传入device参数以检测多GPU模式
         self._setup_output_redirection(device=args.get('device', '0'))
         
         self.logger.info("YOLOv8训练开始")
@@ -1340,6 +1096,8 @@ class YOLOv8Trainer:
                 result = self.train_detection(args)
             elif args['dutyType'] == 'segment':
                 result = self.train_segmentation(args)
+            elif args['dutyType'] == 'pose':
+                result = self.train_pose(args)
             else:
                 self.logger.error(f"不支持的训练任务类型: {args['dutyType']}")
                 return False
@@ -1347,7 +1105,7 @@ class YOLOv8Trainer:
             # 处理返回值：True=成功, False=失败, 'stopped'=被主动停止
             if result == 'stopped':
                 self.logger.info("训练已被主动停止!")
-                return False  # 返回False表示训练未正常完成
+                return 'stopped'
             elif result:
                 self.logger.info("训练成功完成!")
                 return True
@@ -1356,7 +1114,7 @@ class YOLOv8Trainer:
                 return False
                 
         finally:
-            # 无论成功还是失败都清理输出重定向（停止MinIO上传）
+            # 无论成功还是失败都清理输出重定向（停止日志写入）
             self._cleanup_output_redirection()
     
     def _cleanup_output_redirection(self):
@@ -1374,15 +1132,15 @@ class YOLOv8Trainer:
             if hasattr(self, 'original_stderr'):
                 sys.stderr = self.original_stderr
             
-            # 停止MinIO日志上传器
-            if hasattr(self, 'log_uploader') and self.log_uploader:
-                self.log_uploader.stop()
+            # 停止训练日志写入器
+            if hasattr(self, 'log_writer') and self.log_writer:
+                self.log_writer.stop()
         except Exception as e:
             # 即使清理失败也不影响训练结果
             pass
     
-    def get_log_minio_path(self) -> Optional[str]:
-        """获取日志的MinIO完整路径"""
-        if self.log_uploader:
-            return self.log_uploader.get_minio_full_path()
+    def get_log_path(self) -> Optional[str]:
+        """获取日志的本地完整路径"""
+        if self.log_writer:
+            return self.log_writer.get_log_path()
         return None
