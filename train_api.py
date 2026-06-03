@@ -20,6 +20,7 @@ import json
 import shutil
 import random
 import shlex
+import tempfile
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -273,19 +274,6 @@ def analyze_original_dataset_from_splits(original_data_address):
     return aggregate_original_analysis_results(train_result, valid_result, analysis_output_dir)
 
 
-def materialize_dataset_dir(storage_path, split_name):
-    """兼容旧调用：下载 images/json 到本地工作区"""
-    if not PathHandler.is_legacy_remote_uri(storage_path):
-        return storage_path
-
-    return materialize_storage_subdirs(
-        storage_path,
-        subdirs=['images', 'json'],
-        suffix_map={'images': DATASET_IMAGE_EXTENSIONS, 'json': {'.json'}},
-        clean=True
-    )
-
-
 def resolve_dataset_dir_for_conversion(dataset_path, split_name):
     """解析 json2txt 所需的数据目录"""
     return materialize_dataset_dir_for_conversion(dataset_path, split_name)
@@ -304,6 +292,9 @@ DATASET_BUILD_WATCHDOG_IDLE_SECONDS = {
 DATASET_BUILD_PROGRESS_FILE_INTERVAL = 100
 DATASET_BUILD_PROGRESS_SECONDS_INTERVAL = 5
 STORAGE_OBJECT_KEY_PREFIX = os.environ.get('TRAINER_STORAGE_OBJECT_KEY_PREFIX', 'algorithm/trainer')
+LABEL_TASK_STORAGE_DB_PREFIX = os.environ.get('LABEL_TASK_STORAGE_DB_PREFIX', '/app/storage/task')
+LABEL_TASK_STORAGE_LOCAL_PREFIX = os.environ.get('LABEL_TASK_STORAGE_LOCAL_PREFIX', '/volume2/task')
+AUTO_LABEL_REDIS_LOCK_TTL_SECONDS = int(os.environ.get('AUTO_LABEL_REDIS_LOCK_TTL_SECONDS', '604800'))
 MODEL_CONVERT_CONTAINER_ID = os.environ.get('MODEL_CONVERT_CONTAINER_ID', '96350d6935d8')
 MODEL_CONVERT_CONTAINER_WORKDIR = os.environ.get('MODEL_CONVERT_CONTAINER_WORKDIR', '/workspace')
 MODEL_CONVERT_SUPPORTED_PLATFORMS = {'bm1684', 'bm1684x', 'rk3588'}
@@ -515,24 +506,50 @@ def copy_directory_to_storage(
     return success_count, fail_count, failed_files
 
 
-def materialize_local_subdirs(local_path: str, subdirs, suffix_map=None, clean=True) -> str:
-    """确保本地目录下的子目录存在"""
-    local_root = Path(local_path)
-    if clean and local_root.exists():
-        safe_rmtree(local_root)
-    local_root.mkdir(parents=True, exist_ok=True)
+def persist_directory_to_storage(local_dir, storage_prefix, progress_callback=None):
+    """将本地构建产物持久化到存储路径，安全处理源/目标重叠的情况。
 
-    for subdir in subdirs:
-        sub_dir = local_root / subdir
-        sub_dir.mkdir(parents=True, exist_ok=True)
-        count = len(list(sub_dir.rglob('*'))) if sub_dir.exists() else 0
-        logger.info(f"子目录就绪: {sub_dir}, 文件数={count}")
+    本地存储迁移后，构建产物通常已经位于目标路径（或其子目录）。旧逻辑沿用
+    远程对象存储时代的"先 delete_storage_prefix 清空目标，再从同一目录 upload"
+    模式，在本地架构下会先把刚生成的数据删掉，再从已被清空的目录拷贝，结果是
+    数据集/推理结果被悄悄清空且不报错。这里按源与目标的实际关系分别处理：
+    - 源与目标为同一路径：数据已就位，直接统计文件数返回，不做任何删除/拷贝。
+    - 源是目标的子目录：把子目录内容上提到目标，再移除空的子目录。
+    - 源与目标无重叠：保留"清空目标再拷贝"的旧语义（兼容跨目录场景）。
+    """
+    src = Path(local_dir).resolve()
+    target = _resolve_path(str(storage_prefix)).resolve()
 
-    return str(local_root)
+    def _count_and_report():
+        files = [p for p in target.rglob('*') if p.is_file()]
+        if progress_callback:
+            progress_callback(len(files), len(files))
+        return len(files), 0, []
 
+    if src == target:
+        return _count_and_report()
 
-# 兼容旧函数名
-materialize_storage_subdirs = materialize_local_subdirs
+    if target in src.parents:
+        # 源在目标内部（如 YOLO 把结果写进了 results/predict 子目录）：
+        # 上提内容而非先删目标，否则会连源一起删掉。
+        target.mkdir(parents=True, exist_ok=True)
+        for child in list(src.iterdir()):
+            dest = target / child.name
+            if dest.exists():
+                if dest.is_dir():
+                    safe_rmtree(dest)
+                else:
+                    dest.unlink()
+            shutil.move(str(child), str(dest))
+        try:
+            src.rmdir()
+        except OSError:
+            pass
+        return _count_and_report()
+
+    if target.exists():
+        safe_rmtree(target)
+    return copy_directory_to_storage(src, str(target), progress_callback=progress_callback)
 
 
 def parse_storage_relative_path(path):
@@ -550,10 +567,8 @@ def parse_storage_relative_path(path):
     return ensure_local_path(str(path or '').strip())
 
 
-_unused_storage_manager = lambda: None
 read_storage_object_bytes = read_local_file
 read_storage_json_object = read_local_json
-put_storage_bytes = write_local_file
 put_storage_json_object = write_local_json
 delete_storage_object = delete_local_file
 list_storage_objects = list_local_files
@@ -861,11 +876,30 @@ def format_percentage_dict(counter_dict, total_count):
     return percentage_dict
 
 
+def resolve_split_annotation_prefix(dataset_id, split_name):
+    """返回 stats 使用的 split 标注目录，兼容 json/jsons。"""
+    split_prefix = build_storage_object_key('original_dataset', str(dataset_id), split_name)
+    candidates = [f"{split_prefix}/json", f"{split_prefix}/jsons"]
+
+    listed_candidates = []
+    for candidate in candidates:
+        objects = list_storage_objects(candidate, suffixes={'.json'})
+        if objects:
+            return candidate, objects
+        listed_candidates.append((candidate, objects))
+
+    for candidate, objects in listed_candidates:
+        if _resolve_path(candidate).exists():
+            return candidate, objects
+
+    return listed_candidates[0]
+
+
 def repair_and_collect_split_stats(dataset_id, split_name, data_type):
     """基于本地路径修复单个 split 的 images/json 对应关系，并统计标签信息"""
     split_prefix = build_storage_object_key('original_dataset', str(dataset_id), split_name)
     images_prefix = f"{split_prefix}/images"
-    json_prefix = f"{split_prefix}/json"
+    json_prefix, json_object_list = resolve_split_annotation_prefix(dataset_id, split_name)
 
     image_objects = {}
     for object_name in list_storage_objects(images_prefix, suffixes=DATASET_IMAGE_EXTENSIONS):
@@ -880,7 +914,7 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
 
     json_objects = {
         Path(object_name).stem: object_name
-        for object_name in list_storage_objects(json_prefix, suffixes={'.json'})
+        for object_name in json_object_list
     }
 
     removed_json_files = []
@@ -1905,30 +1939,6 @@ def copy_to_storage_and_get_path(local_path, folder_type, sub_folder=None):
         logger.error(f"保存本地工作区路径时出错: {str(e)}")
         return str(local_path)
 
-def save_local_copy_async(storage_path, local_path):
-    def _save_copy():
-        try:
-            if PathHandler.is_legacy_remote_uri(storage_path):
-                source_path = Path(ensure_local_path(storage_path))
-                target_path = Path(local_path)
-                if source_path.resolve() == target_path.resolve():
-                    return
-
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                if source_path.is_dir():
-                    if target_path.exists():
-                        safe_rmtree(target_path)
-                    shutil.copytree(source_path, target_path)
-                else:
-                    shutil.copy2(source_path, target_path)
-                logger.info(f"本地副本保存成功: {source_path} -> {target_path}")
-        except Exception as e:
-            logger.error(f"保存本地副本时出错: {str(e)}")
-    
-    #异步线程
-    thread = threading.Thread(target=_save_copy)
-    thread.daemon = True
-    thread.start()
 
 class TrainerDatabaseManager(BaseDatabaseManager):
     """业务数据库管理器，继承连接池基类，包含业务查询方法"""
@@ -2278,33 +2288,10 @@ class TrainerDatabaseManager(BaseDatabaseManager):
             connection.close()
     
     def get_divided_data_address(self, dataset_id):
-        connection = self.get_connection()
-        if not connection:
-            return None
-        
-        try:
-            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                sql = "SELECT id, original_data_address FROM train_dataset WHERE id = %s"
-                cursor.execute(sql, (dataset_id,))
-                result = cursor.fetchone()
-                
-                if not result:
-                    return None
+        # 与 get_dataset_split_info 查询、解析逻辑完全一致，保留独立方法名仅为
+        # 兼容历史调用点，实现委托以避免重复维护两份相同的 SQL/拆分逻辑。
+        return self.get_dataset_split_info(dataset_id)
 
-                original_data_address = self._ensure_original_data_address(
-                    connection=connection,
-                    cursor=cursor,
-                    dataset_id=dataset_id,
-                    original_data_address=result.get('original_data_address')
-                )
-
-                return self._build_split_addresses(original_data_address)
-        except Exception as e:
-            logger.error(f"查询数据集划分路径失败: {str(e)}")
-            return None
-        finally:
-            connection.close()
-    
     def update_divided_dataset_detail(self, dataset_id, train_tag_sum, val_tag_sum, 
                                        train_tag_num, val_tag_num, 
                                        train_tag_percentage, val_tag_percentage):
@@ -2927,6 +2914,105 @@ class TrainerDatabaseManager(BaseDatabaseManager):
             return False
         finally:
             connection.close()
+
+    def get_label_task_assignee_dirs(self, label_task_id):
+        """读取标注任务分配目录。"""
+        connection = self.get_connection()
+        if not connection:
+            return None
+
+        try:
+            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                sql = """SELECT task_id, user_id, user_nickname, task_dir
+                         FROM label_task_assignee
+                         WHERE task_id = %s AND deleted = b'0'"""
+                cursor.execute(sql, (label_task_id,))
+                return cursor.fetchall()
+        except Exception as e:
+            logger.error(f"查询标注任务分配目录失败: label_task_id={label_task_id}, error={str(e)}")
+            return None
+        finally:
+            connection.close()
+
+    def get_trained_weight_for_auto_label(self, model_id):
+        """读取自动标注所需模型信息。"""
+        connection = self.get_connection()
+        if not connection:
+            return None
+
+        try:
+            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                sql = """SELECT id, bestmodel_address, duty_type, img_size, `class`
+                         FROM trained_weights
+                         WHERE id = %s"""
+                cursor.execute(sql, (model_id,))
+                return cursor.fetchone()
+        except Exception as e:
+            logger.error(f"查询自动标注模型信息失败: model_id={model_id}, error={str(e)}")
+            return None
+        finally:
+            connection.close()
+
+    def update_auto_label_items(self, label_task_id, auto_label_records):
+        """把生成的自动标注 JSON 路径写回 label_task_item。"""
+        if not auto_label_records:
+            return {'updated_count': 0, 'missing_items': []}
+
+        connection = self.get_connection()
+        if not connection:
+            return None
+
+        updated_count = 0
+        missing_items = []
+        try:
+            with connection.cursor() as cursor:
+                update_by_path_sql = """UPDATE label_task_item
+                    SET auto_label_path = %s,
+                        auto_labeled = 1,
+                        update_time = NOW()
+                    WHERE task_id = %s
+                      AND deleted = b'0'
+                      AND image_path = %s"""
+                update_by_name_sql = """UPDATE label_task_item
+                    SET auto_label_path = %s,
+                        auto_labeled = 1,
+                        update_time = NOW()
+                    WHERE task_id = %s
+                      AND deleted = b'0'
+                      AND image_name = %s"""
+
+                for record in auto_label_records:
+                    json_db_path = record.get('json_db_path')
+                    image_db_path = record.get('image_db_path')
+                    image_name = record.get('image_name')
+
+                    cursor.execute(update_by_path_sql, (json_db_path, label_task_id, image_db_path))
+                    affected = cursor.rowcount
+                    if affected == 0 and image_name:
+                        cursor.execute(update_by_name_sql, (json_db_path, label_task_id, image_name))
+                        affected = cursor.rowcount
+
+                    if affected:
+                        updated_count += affected
+                    else:
+                        missing_items.append({
+                            'image_name': image_name,
+                            'image_path': image_db_path,
+                            'auto_label_path': json_db_path
+                        })
+
+            connection.commit()
+            logger.info(
+                f"自动标注结果写回完成: label_task_id={label_task_id}, "
+                f"updated_count={updated_count}, missing_count={len(missing_items)}"
+            )
+            return {'updated_count': updated_count, 'missing_items': missing_items}
+        except Exception as e:
+            connection.rollback()
+            logger.error(f"写回自动标注结果失败: label_task_id={label_task_id}, error={str(e)}")
+            return None
+        finally:
+            connection.close()
     
     def insert_train_chart(self, train_task_id, chart_data_list):
         connection = self.get_connection()
@@ -3050,7 +3136,88 @@ class TrainerDatabaseManager(BaseDatabaseManager):
             return False
         finally:
             connection.close()
-    
+
+    def upsert_train_chart_batch(self, train_task_id, chart_rows):
+        """批量 upsert 多个 epoch 的图表数据，复用单个连接。
+
+        与逐行调用 insert_single_train_chart 语义一致（按 epoch 存在则更新、
+        否则插入），但 CSV 监控线程每 2s 会处理一批新行——逐行各开一条新连接
+        在长训练下持续放大连接开销，这里改为整批共用一条连接，仅一次提交。
+        """
+        if not chart_rows:
+            return 0
+        connection = self.get_connection()
+        if not connection:
+            return 0
+
+        update_sql = """UPDATE train_chart SET
+            time = %s, train_box_loss = %s, train_cls_loss = %s, train_dfl_loss = %s,
+            metrics_precision_B = %s, metrics_recall_B = %s, metrics_mAP50_B = %s, metrics_mAP50_95_B = %s,
+            val_box_loss = %s, val_cls_loss = %s, val_dfl_loss = %s, lr_pg0 = %s, lr_pg1 = %s, lr_pg2 = %s
+            WHERE train_task_id = %s AND epoch = %s"""
+        insert_sql = """INSERT INTO train_chart
+            (train_task_id, epoch, time, train_box_loss, train_cls_loss, train_dfl_loss,
+             metrics_precision_B, metrics_recall_B, metrics_mAP50_B, metrics_mAP50_95_B,
+             val_box_loss, val_cls_loss, val_dfl_loss, lr_pg0, lr_pg1, lr_pg2)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+        check_sql = "SELECT 1 FROM train_chart WHERE train_task_id = %s AND epoch = %s LIMIT 1"
+
+        saved = 0
+        try:
+            with connection.cursor() as cursor:
+                for chart_row in chart_rows:
+                    epoch = chart_row.get('epoch')
+                    try:
+                        cursor.execute(check_sql, (train_task_id, epoch))
+                        if cursor.fetchone():
+                            cursor.execute(update_sql, (
+                                chart_row.get('time'),
+                                chart_row.get('train_box_loss'),
+                                chart_row.get('train_cls_loss'),
+                                chart_row.get('train_dfl_loss'),
+                                chart_row.get('metrics_precision_B'),
+                                chart_row.get('metrics_recall_B'),
+                                chart_row.get('metrics_mAP50_B'),
+                                chart_row.get('metrics_mAP50_95_B'),
+                                chart_row.get('val_box_loss'),
+                                chart_row.get('val_cls_loss'),
+                                chart_row.get('val_dfl_loss'),
+                                chart_row.get('lr_pg0'),
+                                chart_row.get('lr_pg1'),
+                                chart_row.get('lr_pg2'),
+                                train_task_id,
+                                epoch,
+                            ))
+                        else:
+                            cursor.execute(insert_sql, (
+                                train_task_id,
+                                epoch,
+                                chart_row.get('time'),
+                                chart_row.get('train_box_loss'),
+                                chart_row.get('train_cls_loss'),
+                                chart_row.get('train_dfl_loss'),
+                                chart_row.get('metrics_precision_B'),
+                                chart_row.get('metrics_recall_B'),
+                                chart_row.get('metrics_mAP50_B'),
+                                chart_row.get('metrics_mAP50_95_B'),
+                                chart_row.get('val_box_loss'),
+                                chart_row.get('val_cls_loss'),
+                                chart_row.get('val_dfl_loss'),
+                                chart_row.get('lr_pg0'),
+                                chart_row.get('lr_pg1'),
+                                chart_row.get('lr_pg2'),
+                            ))
+                        saved += 1
+                    except Exception as e:
+                        logger.error(f"批量写入图表数据失败 epoch={epoch}: {str(e)}")
+                connection.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"批量写入图表数据失败 train_task_id={train_task_id}: {str(e)}")
+            return saved
+        finally:
+            connection.close()
+
     def clear_train_chart(self, train_task_id):
         connection = self.get_connection()
         if not connection:
@@ -3453,9 +3620,9 @@ class TrainingManager:
 
         if task_info and task_info.get('status') == 'processing':
             error_msg = f"等待数据集构建超时（{max_wait_time}秒）"
-            task_info['status'] = 'failed'
-            task_info['error'] = error_msg
-            task_info['end_time'] = datetime.now()
+            update_dataset_build_status(
+                dataset_id, status='failed', error=error_msg, end_time=datetime.now()
+            )
             return False, error_msg
 
         return True, None
@@ -3927,16 +4094,15 @@ class TrainingManager:
                         
                         if current_line_count > last_line_count:
                             new_rows = rows[last_line_count:]
+                            parsed_rows = []
                             for row in new_rows:
                                 try:
-                                    chart_row = self._parse_csv_row(row)
-                                    self.db_manager.insert_single_train_chart(task_id, chart_row)
-                                    logger.debug(f"实时写入epoch {chart_row['epoch']} 到数据库")
+                                    parsed_rows.append(self._parse_csv_row(row))
                                 except Exception as e:
-                                    logger.error(f"实时写入CSV行失败: {str(e)}")
-                            
+                                    logger.error(f"解析CSV行失败: {str(e)}")
+                            saved = self.db_manager.upsert_train_chart_batch(task_id, parsed_rows)
                             last_line_count = current_line_count
-                            logger.info(f"CSV监控: 已写入 {current_line_count} 条记录到数据库")
+                            logger.info(f"CSV监控: 已写入 {current_line_count} 条记录到数据库 (本轮 {saved})")
                             
                             if self.redis_manager and total_epochs:
                                 try:
@@ -3974,13 +4140,14 @@ class TrainingManager:
             
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
+                parsed_rows = []
                 for row in reader:
                     try:
-                        chart_row = self._parse_csv_row(row)
-                        self.db_manager.insert_single_train_chart(task_id, chart_row)
+                        parsed_rows.append(self._parse_csv_row(row))
                     except Exception as e:
-                        logger.error(f"最终同步CSV行失败 epoch={row.get('epoch')}: {str(e)}")
-            
+                        logger.error(f"最终同步解析CSV行失败 epoch={row.get('epoch')}: {str(e)}")
+                self.db_manager.upsert_train_chart_batch(task_id, parsed_rows)
+
             logger.info(f"CSV最终同步完成: {csv_path}")
         except Exception as e:
             logger.error(f"最终同步CSV到数据库失败: {str(e)}")
@@ -4643,6 +4810,130 @@ def resolve_pose_keypoint_config(dataset_id, dataset_info, split_addresses=None,
     return kpt_labels, kpt_num
 
 
+def _build_yolo_dataset_structure(dataset_id, dataset_info, heartbeat=None):
+    """构建 train/valid YOLO 数据集目录结构的共享核心。
+
+    create_dataset（同步路由）与 _process_create_dataset（异步管线阶段）此前各自
+    维护了一份几乎逐行相同的实现——之前的"删空再拷贝"数据丢失 bug 就同时存在于
+    两份拷贝、需要改两遍。这里抽出共享核心，仅承载两者完全一致的机械逻辑：
+    地址校验 -> 物化源目录 -> 建目录 -> 校验源 -> 并行复制 -> 计数校验 -> 持久化。
+    数据库地址更新与响应构建留在各自调用方（它们的返回契约确实不同）。
+
+    heartbeat: 可选，签名同 update_dataset_build_heartbeat 但已绑定 dataset_id
+               （即 heartbeat(stage=, sub_step=, message=, ...)）。为 None 时
+               （同步路由场景）不上报任何进度心跳。
+    materialize_dataset_dir_for_create 在源目录缺失时抛 FileNotFoundError，
+    这里不捕获，由调用方按各自语义处理（路由 -> 400，管线 -> 阶段异常）。
+
+    返回 dict：
+      失败 {'success': False, 'error_kind': 'invalid'|'io', 'error': str, 'failed_files'?: list}
+      成功 {'success': True, 'dataset_storage_address': str, 'local_dataset_address': str,
+            'counts': {'train_images','train_labels','valid_images','valid_labels'}}
+    """
+    def _copy(src_dir, dest_dir, sub_step, action_name):
+        callback = None
+        if heartbeat:
+            heartbeat(stage='build', sub_step=sub_step, message=f"开始{action_name}",
+                      processed_files=0, total_files=None, force_log=True)
+
+            def callback(processed_files, total_files):
+                heartbeat(stage='build', sub_step=sub_step,
+                          message=f"{action_name}: {processed_files}/{total_files}",
+                          processed_files=processed_files, total_files=total_files,
+                          force_log=True)
+        return copy_directory_files_parallel(src_dir, dest_dir, progress_callback=callback)
+
+    original_train_data_address = dataset_info.get('original_train_data_address')
+    original_val_data_address = dataset_info.get('original_val_data_address')
+    if not original_train_data_address:
+        return {'success': False, 'error_kind': 'invalid',
+                'error': '数据集信息不完整，缺少original_train_data_address'}
+    if not original_val_data_address:
+        return {'success': False, 'error_kind': 'invalid',
+                'error': '数据集信息不完整，缺少original_val_data_address'}
+
+    local_train_address = materialize_dataset_dir_for_create(original_train_data_address, '训练集')
+    local_val_address = materialize_dataset_dir_for_create(original_val_data_address, '验证集')
+
+    dataset_storage_address = build_storage_path('train_data', str(dataset_id))
+    output_root = build_storage_local_path('train_data', str(dataset_id), require_exists=False)
+    datasets_root = output_root / "datasets"
+    train_images_dir = datasets_root / "train" / "images"
+    train_labels_dir = datasets_root / "train" / "labels"
+    valid_images_dir = datasets_root / "valid" / "images"
+    valid_labels_dir = datasets_root / "valid" / "labels"
+
+    if datasets_root.exists():
+        safe_rmtree(datasets_root)
+    for d in (train_images_dir, train_labels_dir, valid_images_dir, valid_labels_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    src_train_images = Path(local_train_address) / "images"
+    src_train_labels = Path(local_train_address) / "labels"
+    if not src_train_images.exists():
+        return {'success': False, 'error_kind': 'invalid', 'error': f"训练集images目录不存在: {src_train_images}"}
+    if not src_train_labels.exists():
+        return {'success': False, 'error_kind': 'invalid', 'error': f"训练集labels目录不存在: {src_train_labels}"}
+
+    train_images_count = _copy(src_train_images, train_images_dir, 'train_images', '复制训练集图片')
+    train_labels_count = _copy(src_train_labels, train_labels_dir, 'train_labels', '复制训练集标签')
+
+    src_val_images = Path(local_val_address) / "images"
+    src_val_labels = Path(local_val_address) / "labels"
+    if not src_val_images.exists():
+        return {'success': False, 'error_kind': 'invalid', 'error': f"验证集images目录不存在: {src_val_images}"}
+    if not src_val_labels.exists():
+        return {'success': False, 'error_kind': 'invalid', 'error': f"验证集labels目录不存在: {src_val_labels}"}
+
+    valid_images_count = _copy(src_val_images, valid_images_dir, 'valid_images', '复制验证集图片')
+    valid_labels_count = _copy(src_val_labels, valid_labels_dir, 'valid_labels', '复制验证集标签')
+
+    if train_images_count == 0:
+        return {'success': False, 'error_kind': 'invalid', 'error': f"训练集图片为空: {src_train_images}"}
+    if train_labels_count == 0:
+        return {'success': False, 'error_kind': 'invalid', 'error': f"训练集标签为空: {src_train_labels}"}
+    if valid_images_count == 0:
+        return {'success': False, 'error_kind': 'invalid', 'error': f"验证集图片为空: {src_val_images}"}
+    if valid_labels_count == 0:
+        return {'success': False, 'error_kind': 'invalid', 'error': f"验证集标签为空: {src_val_labels}"}
+
+    local_dataset_address = str(output_root.resolve())
+    logger.info(f"数据集结构构建完成: {local_dataset_address}")
+
+    if heartbeat:
+        heartbeat(stage='build', sub_step='prepare_upload_storage',
+                  message='准备保存训练数据集结构', processed_files=0, total_files=0, force_log=True)
+
+    persist_callback = None
+    if heartbeat:
+        def persist_callback(processed_files, total_files):
+            heartbeat(stage='build', sub_step='upload_storage',
+                      message=f"保存训练数据集结构: {processed_files}/{total_files}",
+                      processed_files=processed_files, total_files=total_files, force_log=True)
+
+    dataset_object_path = parse_storage_relative_path(dataset_storage_address)
+    success_count, fail_count, failed_files = persist_directory_to_storage(
+        datasets_root, f"{dataset_object_path}/datasets", progress_callback=persist_callback
+    )
+    if fail_count:
+        return {'success': False, 'error_kind': 'io',
+                'error': f"数据集保存到本地工作区失败: fail_count={fail_count}",
+                'failed_files': failed_files[:10]}
+    logger.info(f"数据集目录已保存到本地工作区: {dataset_storage_address}/datasets, count={success_count}")
+
+    return {
+        'success': True,
+        'dataset_storage_address': dataset_storage_address,
+        'local_dataset_address': local_dataset_address,
+        'counts': {
+            'train_images': train_images_count,
+            'train_labels': train_labels_count,
+            'valid_images': valid_images_count,
+            'valid_labels': valid_labels_count,
+        },
+    }
+
+
 @app.route('/algorithm/datasets/create', methods=['POST'])
 def create_dataset():
     """构建数据集接口"""
@@ -4675,117 +4966,30 @@ def create_dataset():
         if user_name:
             if not db_manager.update_dataset_update_by(dataset_id, user_name):
                 logger.warning(f"更新update_by字段失败: dataset_id={dataset_id}, user_name={user_name}")
-        
+
         dataset_info = db_manager.get_dataset_split_info(dataset_id)
         if not dataset_info:
             return jsonify({"code": 1, "data": {"message": f"未找到dataset_id={dataset_id}的数据集信息"}}), 404
-        
-        original_train_data_address = dataset_info.get('original_train_data_address')
-        original_val_data_address = dataset_info.get('original_val_data_address')
-        
-        if not original_train_data_address:
-            return jsonify({
-                "code": 1,
-                "data": {"message": "数据集信息不完整，缺少original_train_data_address"}
-            }), 400
-        
-        if not original_val_data_address:
-            return jsonify({
-                "code": 1,
-                "data": {"message": "数据集信息不完整，缺少original_val_data_address"}
-            }), 400
-        
-        logger.info(f"训练集路径: {original_train_data_address}")
-        logger.info(f"验证集路径: {original_val_data_address}")
-        
-        local_train_address = materialize_dataset_dir_for_create(original_train_data_address, '训练集')
-        local_val_address = materialize_dataset_dir_for_create(original_val_data_address, '验证集')
-        
-        logger.info(f"处理训练集路径: {original_train_data_address} -> {local_train_address}")
-        logger.info(f"处理验证集路径: {original_val_data_address} -> {local_val_address}")
-        
-        dataset_storage_address = build_storage_path('train_data', str(dataset_id))
-        output_root = build_storage_local_path('train_data', str(dataset_id), require_exists=False)
-        datasets_root = output_root / "datasets"
 
-        train_images_dir = datasets_root / "train" / "images"
-        train_labels_dir = datasets_root / "train" / "labels"
-        valid_images_dir = datasets_root / "valid" / "images"
-        valid_labels_dir = datasets_root / "valid" / "labels"
-        
         try:
-            if datasets_root.exists():
-                safe_rmtree(datasets_root)
-                logger.info(f"已删除旧的数据集目录: {datasets_root}")
-            
-            train_images_dir.mkdir(parents=True, exist_ok=True)
-            train_labels_dir.mkdir(parents=True, exist_ok=True)
-            valid_images_dir.mkdir(parents=True, exist_ok=True)
-            valid_labels_dir.mkdir(parents=True, exist_ok=True)
-            
-            src_train_images = Path(local_train_address) / "images"
-            src_train_labels = Path(local_train_address) / "labels"
-            
-            if not src_train_images.exists():
-                return jsonify({"code": 1, "data": {"message": f"训练集images目录不存在: {src_train_images}"}}), 400
-            if not src_train_labels.exists():
-                return jsonify({"code": 1, "data": {"message": f"训练集labels目录不存在: {src_train_labels}"}}), 400
-            
-            train_images_count = copy_directory_files_parallel(src_train_images, train_images_dir)
-            logger.info(f"训练集images复制完成: {src_train_images} -> {train_images_dir}, count={train_images_count}")
-
-            train_labels_count = copy_directory_files_parallel(src_train_labels, train_labels_dir)
-            logger.info(f"训练集labels复制完成: {src_train_labels} -> {train_labels_dir}, count={train_labels_count}")
-
-            src_val_images = Path(local_val_address) / "images"
-            src_val_labels = Path(local_val_address) / "labels"
-
-            if not src_val_images.exists():
-                return jsonify({"code": 1, "data": {"message": f"验证集images目录不存在: {src_val_images}"}}), 400
-            if not src_val_labels.exists():
-                return jsonify({"code": 1, "data": {"message": f"验证集labels目录不存在: {src_val_labels}"}}), 400
-
-            valid_images_count = copy_directory_files_parallel(src_val_images, valid_images_dir)
-            logger.info(f"验证集images复制完成: {src_val_images} -> {valid_images_dir}, count={valid_images_count}")
-
-            valid_labels_count = copy_directory_files_parallel(src_val_labels, valid_labels_dir)
-            logger.info(f"验证集labels复制完成: {src_val_labels} -> {valid_labels_dir}, count={valid_labels_count}")
-
-            if train_images_count == 0:
-                return jsonify({"code": 1, "data": {"message": f"训练集图片为空: {src_train_images}"}}), 400
-            if train_labels_count == 0:
-                return jsonify({"code": 1, "data": {"message": f"训练集标签为空: {src_train_labels}"}}), 400
-            if valid_images_count == 0:
-                return jsonify({"code": 1, "data": {"message": f"验证集图片为空: {src_val_images}"}}), 400
-            if valid_labels_count == 0:
-                return jsonify({"code": 1, "data": {"message": f"验证集标签为空: {src_val_labels}"}}), 400
-            
-            local_dataset_address = str(output_root.resolve())
-            logger.info(f"数据集创建成功: {local_dataset_address}")
-
-            dataset_object_path = parse_storage_relative_path(dataset_storage_address)
-            delete_storage_prefix(f"{dataset_object_path}/datasets")
-            success_count, fail_count, failed_files = upload_directory_to_storage(
-                datasets_root,
-                f"{dataset_object_path}/datasets"
-            )
-            if fail_count:
-                return jsonify({
-                    "code": 1,
-                    "data": {
-                        "message": f"数据集保存到本地工作区失败: fail_count={fail_count}",
-                        "failed_files": failed_files[:10]
-                    }
-                }), 500
-            logger.info(f"数据集目录已保存到本地工作区: {dataset_storage_address}/datasets, count={success_count}")
-            
+            result = _build_yolo_dataset_structure(dataset_id, dataset_info)
         except FileNotFoundError as e:
             logger.error(f"数据集创建失败，路径不存在: {str(e)}")
             return jsonify({"code": 1, "data": {"message": f"路径不存在: {str(e)}"}}), 400
         except Exception as e:
             logger.error(f"数据集创建失败: {str(e)}")
             return jsonify({"code": 1, "data": {"message": f"数据集创建失败: {str(e)}"}}), 500
-        
+
+        if not result['success']:
+            status = 400 if result.get('error_kind') == 'invalid' else 500
+            payload = {"message": result['error']}
+            if result.get('failed_files'):
+                payload['failed_files'] = result['failed_files']
+            return jsonify({"code": 1, "data": payload}), status
+
+        dataset_storage_address = result['dataset_storage_address']
+        local_dataset_address = result['local_dataset_address']
+
         if not db_manager.update_dataset_address(dataset_id, dataset_storage_address):
             logger.warning("数据集创建成功但数据库更新dataset_address失败")
             return jsonify({
@@ -4796,7 +5000,7 @@ def create_dataset():
                     "dataset_address": dataset_storage_address
                 }
             }), 500
-        
+
         return jsonify({
             "code": 0,
             "data": {
@@ -4808,7 +5012,7 @@ def create_dataset():
                 "user_name": user_name
             }
         })
-        
+
     except Exception as e:
         return handle_api_exception(e, "创建数据集")
     finally:
@@ -5092,9 +5296,9 @@ def build_yolo_dataset():
                 if not db_manager.update_dataset_process_status(dataset_id, 0):
                     error_msg = "开始构建时更新train_dataset.process_status为0失败"
                     logger.error(f"[异步] {error_msg}: dataset_id={dataset_id}")
-                    dataset_build_tasks[dataset_id_str]['status'] = 'failed'
-                    dataset_build_tasks[dataset_id_str]['error'] = error_msg
-                    dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                    update_dataset_build_status(
+                        dataset_id, status='failed', error=error_msg, end_time=datetime.now()
+                    )
                     callback_message = error_msg
                     return
 
@@ -5144,9 +5348,9 @@ def build_yolo_dataset():
                         if not result.get('success'):
                             error_msg = result.get('error', '未知错误')
                             logger.error(f"[异步][{idx}/{total_stages}] 失败: {error_msg}")
-                            dataset_build_tasks[dataset_id_str]['status'] = 'failed'
-                            dataset_build_tasks[dataset_id_str]['error'] = error_msg
-                            dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                            update_dataset_build_status(
+                                dataset_id, status='failed', error=error_msg, end_time=datetime.now()
+                            )
                             db_manager.update_dataset_process_status(dataset_id, 2, error_msg)
                             callback_message = error_msg
                             return
@@ -5164,9 +5368,9 @@ def build_yolo_dataset():
                         error_msg = str(e)
                         logger.error(f"[异步][{idx}/{total_stages}] 异常: {error_msg}")
                         logger.error(traceback.format_exc())
-                        dataset_build_tasks[dataset_id_str]['status'] = 'failed'
-                        dataset_build_tasks[dataset_id_str]['error'] = error_msg
-                        dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                        update_dataset_build_status(
+                            dataset_id, status='failed', error=error_msg, end_time=datetime.now()
+                        )
                         db_manager.update_dataset_process_status(dataset_id, 2, error_msg)
                         callback_message = error_msg
                         return
@@ -5174,11 +5378,14 @@ def build_yolo_dataset():
                 if not db_manager.update_dataset_process_status(dataset_id, 1):
                     error_msg = "全部处理完成，但更新train_dataset.process_status为1失败"
                     logger.error(f"[异步] {error_msg}: dataset_id={dataset_id}")
-                    dataset_build_tasks[dataset_id_str]['status'] = 'failed'
-                    dataset_build_tasks[dataset_id_str]['error'] = error_msg
-                    dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
-                    dataset_build_tasks[dataset_id_str]['stage'] = 'done'
-                    dataset_build_tasks[dataset_id_str]['current_stage_index'] = total_stages
+                    update_dataset_build_status(
+                        dataset_id,
+                        status='failed',
+                        error=error_msg,
+                        end_time=datetime.now(),
+                        stage='done',
+                        current_stage_index=total_stages,
+                    )
                     db_manager.update_dataset_process_status(dataset_id, 2, error_msg)
                     callback_message = error_msg
                     return
@@ -5186,17 +5393,17 @@ def build_yolo_dataset():
                 total_duration = round(time.time() - start_time, 2)
                 logger.info(f"[异步] YOLO数据集构建流程完成: dataset_id={dataset_id}, 耗时: {total_duration}s")
 
-                dataset_build_tasks[dataset_id_str]['status'] = 'completed'
-                dataset_build_tasks[dataset_id_str]['stage'] = 'done'
-                dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                update_dataset_build_status(
+                    dataset_id, status='completed', stage='done', end_time=datetime.now()
+                )
                 callback_success = True
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"[异步] YOLO数据集构建流程异常: dataset_id={dataset_id}, error={error_msg}")
                 logger.error(traceback.format_exc())
-                dataset_build_tasks[dataset_id_str]['status'] = 'failed'
-                dataset_build_tasks[dataset_id_str]['error'] = error_msg
-                dataset_build_tasks[dataset_id_str]['end_time'] = datetime.now()
+                update_dataset_build_status(
+                    dataset_id, status='failed', error=error_msg, end_time=datetime.now()
+                )
                 callback_message = error_msg
             finally:
                 watchdog_stop_event.set()
@@ -5531,173 +5738,40 @@ def _collect_keypoint_labels_from_split_dirs(addresses):
 
 
 def _process_create_dataset(dataset_id):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    MAX_COPY_WORKERS = 16
-    
-    def copy_file(src_dest_tuple):
-        src, dest = src_dest_tuple
-        try:
-            shutil.copy2(src, dest)
-            return True
-        except Exception as e:
-            logger.error(f"复制文件失败 {src}: {e}")
-            return False
-    
-    def make_progress_callback(sub_step, action_name):
-        def progress_callback(processed_files, total_files):
-            update_dataset_build_heartbeat(
-                dataset_id,
-                stage='build',
-                sub_step=sub_step,
-                message=f"{action_name}: {processed_files}/{total_files}",
-                processed_files=processed_files,
-                total_files=total_files,
-                force_log=True
-            )
-        return progress_callback
+    def heartbeat(**kwargs):
+        update_dataset_build_heartbeat(dataset_id, **kwargs)
 
-    def parallel_copy_files(src_dir, dest_dir, sub_step, action_name):
-        """并行复制目录中的所有文件"""
-        update_dataset_build_heartbeat(
-            dataset_id,
-            stage='build',
-            sub_step=sub_step,
-            message=f"开始{action_name}",
-            processed_files=0,
-            total_files=None,
-            force_log=True
-        )
-        return copy_directory_files_parallel(
-            src_dir,
-            dest_dir,
-            max_workers=MAX_COPY_WORKERS,
-            progress_callback=make_progress_callback(sub_step, action_name)
-        )
-    
     dataset_info = db_manager.get_dataset_split_info(dataset_id)
     if not dataset_info:
         return {'success': False, 'error': f"未找到dataset_id={dataset_id}的数据集信息"}
-    
-    original_train_data_address = dataset_info.get('original_train_data_address')
-    original_val_data_address = dataset_info.get('original_val_data_address')
-    
-    if not original_train_data_address:
-        return {'success': False, 'error': "缺少original_train_data_address"}
-    if not original_val_data_address:
-        return {'success': False, 'error': "缺少original_val_data_address"}
-    
-    local_train_address = materialize_dataset_dir_for_create(original_train_data_address, '训练集')
-    local_val_address = materialize_dataset_dir_for_create(original_val_data_address, '验证集')
 
-    dataset_storage_address = build_storage_path('train_data', str(dataset_id))
-    output_root = build_storage_local_path('train_data', str(dataset_id), require_exists=False)
-    datasets_root = output_root / "datasets"
-    
-    train_images_dir = datasets_root / "train" / "images"
-    train_labels_dir = datasets_root / "train" / "labels"
-    valid_images_dir = datasets_root / "valid" / "images"
-    valid_labels_dir = datasets_root / "valid" / "labels"
-    
-    if datasets_root.exists():
-        safe_rmtree(datasets_root)
-    
-    train_images_dir.mkdir(parents=True, exist_ok=True)
-    train_labels_dir.mkdir(parents=True, exist_ok=True)
-    valid_images_dir.mkdir(parents=True, exist_ok=True)
-    valid_labels_dir.mkdir(parents=True, exist_ok=True)
-    
-    src_train_images = Path(local_train_address) / "images"
-    src_train_labels = Path(local_train_address) / "labels"
-    
-    if not src_train_images.exists():
-        return {'success': False, 'error': f"训练集images目录不存在: {src_train_images}"}
-    if not src_train_labels.exists():
-        return {'success': False, 'error': f"训练集labels目录不存在: {src_train_labels}"}
-    
-    # 并行复制训练集文件
-    train_images_count = parallel_copy_files(src_train_images, train_images_dir, 'train_images', '复制训练集图片')
-    train_labels_count = parallel_copy_files(src_train_labels, train_labels_dir, 'train_labels', '复制训练集标签')
-    
-    src_val_images = Path(local_val_address) / "images"
-    src_val_labels = Path(local_val_address) / "labels"
-    
-    if not src_val_images.exists():
-        return {'success': False, 'error': f"验证集images目录不存在: {src_val_images}"}
-    if not src_val_labels.exists():
-        return {'success': False, 'error': f"验证集labels目录不存在: {src_val_labels}"}
-    
-    valid_images_count = parallel_copy_files(src_val_images, valid_images_dir, 'valid_images', '复制验证集图片')
-    valid_labels_count = parallel_copy_files(src_val_labels, valid_labels_dir, 'valid_labels', '复制验证集标签')
+    try:
+        result = _build_yolo_dataset_structure(dataset_id, dataset_info, heartbeat=heartbeat)
+    except FileNotFoundError as e:
+        return {'success': False, 'error': f"路径不存在: {str(e)}"}
 
-    if train_images_count == 0:
-        return {'success': False, 'error': f"训练集图片为空: {src_train_images}"}
-    if train_labels_count == 0:
-        return {'success': False, 'error': f"训练集标签为空: {src_train_labels}"}
-    if valid_images_count == 0:
-        return {'success': False, 'error': f"验证集图片为空: {src_val_images}"}
-    if valid_labels_count == 0:
-        return {'success': False, 'error': f"验证集标签为空: {src_val_labels}"}
-    
-    local_dataset_address = str(output_root.resolve())
+    if not result['success']:
+        return {'success': False, 'error': result['error']}
 
-    dataset_object_path = parse_storage_relative_path(dataset_storage_address)
-    update_dataset_build_heartbeat(
-        dataset_id,
-        stage='build',
-        sub_step='prepare_upload_storage',
-        message='准备保存训练数据集结构',
-        processed_files=0,
-        total_files=0,
-        force_log=True
-    )
-    delete_storage_prefix(f"{dataset_object_path}/datasets")
-    success_count, fail_count, failed_files = upload_directory_to_storage(
-        datasets_root,
-        f"{dataset_object_path}/datasets",
-        progress_callback=make_progress_callback('upload_storage', '保存训练数据集结构')
-    )
-    if fail_count:
-        return {
-            'success': False,
-            'error': f"保存训练数据集到本地工作区失败: fail_count={fail_count}, failed_files={failed_files[:5]}"
-        }
+    dataset_storage_address = result['dataset_storage_address']
+    counts = result['counts']
 
-    update_dataset_build_heartbeat(
-        dataset_id,
-        stage='build',
-        sub_step='update_db',
-        message='更新训练数据集地址到数据库',
-        force_log=True
-    )
+    heartbeat(stage='build', sub_step='update_db', message='更新训练数据集地址到数据库', force_log=True)
     if not db_manager.update_dataset_address(dataset_id, dataset_storage_address):
         return {'success': False, 'error': "数据库更新dataset_address失败"}
-    update_dataset_build_heartbeat(
-        dataset_id,
-        stage='build',
-        sub_step='build_done',
-        message='训练数据集结构构建完成',
-        processed_files=0,
-        total_files=0,
-        force_log=True
-    )
-    
+    heartbeat(stage='build', sub_step='build_done', message='训练数据集结构构建完成',
+              processed_files=0, total_files=0, force_log=True)
+
     return {
         'success': True,
         'output': {
             'dataset_path': dataset_storage_address,
-            'local_dataset_path': local_dataset_address,
+            'local_dataset_path': result['local_dataset_address'],
             'structure': {
-                'train': {
-                    'images': train_images_count,
-                    'labels': train_labels_count
-                },
-                'valid': {
-                    'images': valid_images_count,
-                    'labels': valid_labels_count
-                }
+                'train': {'images': counts['train_images'], 'labels': counts['train_labels']},
+                'valid': {'images': counts['valid_images'], 'labels': counts['valid_labels']},
             },
-            'total_files': train_images_count + train_labels_count + valid_images_count + valid_labels_count
+            'total_files': sum(counts.values()),
         }
     }
 
@@ -6032,10 +6106,110 @@ class PredictRedisManager:
             return False
 
 
+class AutoLabelRedisManager:
+    """自动标注任务 Redis 进行中标记。"""
+
+    KEY_PREFIX = "auto_label"
+
+    def __init__(self, config):
+        self.config = config
+        self.client = None
+        self._connect()
+
+    def _connect(self):
+        try:
+            import redis
+            self.client = redis.Redis(
+                host=self.config['host'],
+                port=self.config['port'],
+                db=11,
+                password=self.config['password'],
+                decode_responses=True
+            )
+            self.client.ping()
+            logger.info(f"AutoLabelRedisManager连接成功: {self.config['host']}:{self.config['port']}, db=11")
+        except ImportError:
+            logger.error("redis模块未安装")
+            self.client = None
+        except Exception as e:
+            logger.error(f"AutoLabelRedisManager连接失败: {str(e)}")
+            self.client = None
+
+    def build_key(self, label_task_id):
+        return f"{self.KEY_PREFIX}:{label_task_id}"
+
+    def start_task(self, label_task_id, model_id, conf, classes):
+        """创建进行中 key。存在则说明该标注任务已有自动标注在跑。"""
+        if not self.client:
+            logger.warning("AutoLabelRedisManager未连接，无法创建自动标注状态key")
+            return False, None, "Redis不可用，无法创建自动标注状态key"
+
+        key = self.build_key(label_task_id)
+        value = json.dumps({
+            'label_task_id': str(label_task_id),
+            'model_id': str(model_id),
+            'conf': str(conf),
+            'classes': classes,
+            'status': 'processing',
+            'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }, ensure_ascii=False)
+
+        try:
+            created = self.client.set(
+                key,
+                value,
+                nx=True,
+                ex=AUTO_LABEL_REDIS_LOCK_TTL_SECONDS
+            )
+            if created:
+                logger.info(f"自动标注状态key创建成功: {key}")
+                return True, key, None
+
+            existing_value = self.client.get(key)
+            logger.warning(f"自动标注任务已在进行中: key={key}, value={existing_value}")
+            return False, key, existing_value or "自动标注任务已在进行中"
+        except Exception as e:
+            logger.error(f"创建自动标注状态key失败: key={key}, error={str(e)}")
+            return False, None, str(e)
+
+    def finish_task(self, label_task_id):
+        """任务完成后删除进行中 key。"""
+        if not self.client:
+            logger.warning("AutoLabelRedisManager未连接，跳过删除自动标注状态key")
+            return False
+
+        key = self.build_key(label_task_id)
+        try:
+            self.client.delete(key)
+            logger.info(f"自动标注状态key已删除: {key}")
+            return True
+        except Exception as e:
+            logger.error(f"删除自动标注状态key失败: key={key}, error={str(e)}")
+            return False
+
+
 predict_redis_manager = PredictRedisManager(redis_config)
+auto_label_redis_manager = AutoLabelRedisManager(redis_config)
 
 dataset_build_tasks = {}
 dataset_build_tasks_lock = threading.Lock()
+
+
+def update_dataset_build_status(dataset_id, **fields):
+    """持锁更新 dataset_build_tasks 中某任务的状态字段。
+
+    async_build_pipeline 过去对该共享字典的失败/完成态写入不加锁，而
+    heartbeat / watchdog / 状态查询接口都通过 dataset_build_tasks_lock 读取，
+    读写锁不一致存在竞态（脏读、丢失更新）。所有非 heartbeat 的状态变更统一
+    走这里，保证与读取端使用同一把锁。
+    """
+    dataset_id_str = str(dataset_id)
+    with dataset_build_tasks_lock:
+        task_info = dataset_build_tasks.get(dataset_id_str)
+        if not task_info:
+            return False
+        task_info.update(fields)
+    return True
 
 
 def update_dataset_build_heartbeat(
@@ -6156,6 +6330,480 @@ def dataset_processing_response(dataset_id, action_name):
             "status": "processing"
         }
     }), 409
+
+
+def _read_ffmpeg_stderr(stderr_file) -> str:
+    """从 ffmpeg 的 stderr 临时文件读取全部内容（解码为文本）。"""
+    if stderr_file is None:
+        return ''
+    try:
+        stderr_file.seek(0)
+        return stderr_file.read().decode('utf-8', errors='replace')
+    except Exception:
+        return ''
+
+
+def normalize_posix_path(path):
+    return str(path or '').strip().replace('\\', '/')
+
+
+def map_label_task_path_to_local(path):
+    path_str = normalize_posix_path(path)
+    db_prefix = normalize_posix_path(LABEL_TASK_STORAGE_DB_PREFIX).rstrip('/')
+    local_prefix = normalize_posix_path(LABEL_TASK_STORAGE_LOCAL_PREFIX).rstrip('/')
+    if db_prefix and local_prefix and (path_str == db_prefix or path_str.startswith(f"{db_prefix}/")):
+        suffix = path_str[len(db_prefix):].lstrip('/')
+        return str(Path(local_prefix) / suffix)
+    return path_str
+
+
+def map_label_task_path_to_db(path):
+    path_str = normalize_posix_path(path)
+    db_prefix = normalize_posix_path(LABEL_TASK_STORAGE_DB_PREFIX).rstrip('/')
+    local_prefix = normalize_posix_path(LABEL_TASK_STORAGE_LOCAL_PREFIX).rstrip('/')
+    if db_prefix and local_prefix and (path_str == local_prefix or path_str.startswith(f"{local_prefix}/")):
+        suffix = path_str[len(local_prefix):].lstrip('/')
+        return f"{db_prefix}/{suffix}" if suffix else db_prefix
+    return path_str
+
+
+def scan_auto_label_image_dir(image_root: Path):
+    image_paths = []
+    existing_json_keys = set()
+
+    for path in image_root.rglob('*'):
+        if not path.is_file():
+            continue
+
+        relative_key = path.relative_to(image_root).with_suffix('').as_posix()
+        suffix = path.suffix.lower()
+        if suffix in DATASET_IMAGE_EXTENSIONS:
+            image_paths.append(path)
+        elif suffix == '.json':
+            existing_json_keys.add(relative_key)
+
+    return sorted(image_paths), existing_json_keys
+
+
+def has_matching_labelme_json(img_path: Path, image_root: Path, existing_json_keys) -> bool:
+    return img_path.relative_to(image_root).with_suffix('').as_posix() in existing_json_keys
+
+
+def parse_trained_class_mapping(value):
+    if value is None:
+        return {}
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='ignore')
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return {}
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+
+    mapping = {}
+    if isinstance(value, dict):
+        for key, raw_id in value.items():
+            label = str(key).strip()
+            try:
+                cls_id = int(raw_id)
+                if label:
+                    mapping[label] = cls_id
+                continue
+            except (TypeError, ValueError):
+                pass
+
+            try:
+                cls_id = int(key)
+                label = str(raw_id).strip()
+                if label:
+                    mapping[label] = cls_id
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(value, list):
+        for cls_id, label in enumerate(value):
+            label = str(label).strip()
+            if label:
+                mapping[label] = cls_id
+
+    return mapping
+
+
+def normalize_auto_label_classes(classes_value):
+    if classes_value is None:
+        return []
+    if isinstance(classes_value, bytes):
+        classes_value = classes_value.decode('utf-8', errors='ignore')
+    if isinstance(classes_value, str):
+        raw_value = classes_value.strip()
+        if not raw_value:
+            return []
+        try:
+            parsed = json.loads(raw_value)
+            return normalize_auto_label_classes(parsed)
+        except json.JSONDecodeError:
+            return [item.strip() for item in raw_value.split(',') if item.strip()]
+    if isinstance(classes_value, dict):
+        return [str(key).strip() for key in classes_value.keys() if str(key).strip()]
+    if isinstance(classes_value, (list, tuple, set)):
+        return [str(item).strip() for item in classes_value if str(item).strip()]
+    return [str(classes_value).strip()] if str(classes_value).strip() else []
+
+
+def build_model_class_mapping_from_yolo(model):
+    names = getattr(model, 'names', {}) or {}
+    if isinstance(names, dict):
+        return {str(name).strip(): int(cls_id) for cls_id, name in names.items() if str(name).strip()}
+    if isinstance(names, (list, tuple)):
+        return {str(name).strip(): idx for idx, name in enumerate(names) if str(name).strip()}
+    return {}
+
+
+def resolve_auto_label_target_class_ids(classes_value, class_mapping):
+    requested_classes = normalize_auto_label_classes(classes_value)
+    if not requested_classes:
+        raise ValueError("classes不能为空")
+
+    target_class_ids = set()
+    missing_classes = []
+    for class_name in requested_classes:
+        if class_name in class_mapping:
+            target_class_ids.add(int(class_mapping[class_name]))
+            continue
+        try:
+            target_class_ids.add(int(class_name))
+        except (TypeError, ValueError):
+            missing_classes.append(class_name)
+
+    if missing_classes:
+        available_classes = sorted(class_mapping.keys())
+        raise ValueError(
+            f"classes中存在未匹配的类别: {missing_classes}, 可用类别: {available_classes}"
+        )
+    if not target_class_ids:
+        raise ValueError("classes未匹配到任何模型类别ID")
+
+    return target_class_ids, requested_classes
+
+
+def read_image_for_auto_label(img_path: Path):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError(f"自动标注依赖缺失: {e}")
+
+    try:
+        data = np.fromfile(str(img_path), dtype=np.uint8)
+    except OSError:
+        return None
+
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def get_auto_label_name(model, cls_id, id_to_label):
+    if cls_id in id_to_label:
+        return id_to_label[cls_id]
+
+    names = getattr(model, 'names', {})
+    if isinstance(names, dict):
+        return str(names.get(cls_id, names.get(str(cls_id), cls_id)))
+    if isinstance(names, (list, tuple)) and 0 <= cls_id < len(names):
+        return str(names[cls_id])
+    return str(cls_id)
+
+
+def build_auto_labelme_json(img_path: Path, image_width, image_height, shapes):
+    return {
+        "version": "5.0.1",
+        "flags": {},
+        "shapes": shapes,
+        "imagePath": img_path.name,
+        "imageData": None,
+        "imageHeight": image_height,
+        "imageWidth": image_width,
+    }
+
+
+def run_auto_label_for_task_dirs(model, task_dirs, conf, target_class_ids, class_mapping):
+    id_to_label = {int(cls_id): label for label, cls_id in class_mapping.items()}
+    summary = {
+        'task_dir_count': len(task_dirs),
+        'total_images': 0,
+        'pending_images': 0,
+        'generated_count': 0,
+        'skipped_existing_count': 0,
+        'skipped_empty_count': 0,
+        'unreadable_count': 0,
+        'failed_count': 0,
+        'generated_records': [],
+        'failed_images': [],
+        'task_dirs': [],
+    }
+
+    for task_dir in task_dirs:
+        db_task_dir = normalize_posix_path(task_dir)
+        local_task_dir = Path(map_label_task_path_to_local(db_task_dir))
+        dir_result = {
+            'task_dir': db_task_dir,
+            'local_task_dir': str(local_task_dir),
+            'total_images': 0,
+            'pending_images': 0,
+            'generated_count': 0,
+            'skipped_existing_count': 0,
+            'skipped_empty_count': 0,
+            'unreadable_count': 0,
+            'failed_count': 0,
+        }
+        summary['task_dirs'].append(dir_result)
+
+        if not local_task_dir.exists():
+            raise FileNotFoundError(f"标注任务目录不存在: {local_task_dir}")
+        if not local_task_dir.is_dir():
+            raise NotADirectoryError(f"标注任务路径不是目录: {local_task_dir}")
+
+        image_paths, existing_json_keys = scan_auto_label_image_dir(local_task_dir)
+        pending_count = sum(
+            1 for img_path in image_paths
+            if not has_matching_labelme_json(img_path, local_task_dir, existing_json_keys)
+        )
+        dir_result['total_images'] = len(image_paths)
+        dir_result['pending_images'] = pending_count
+        summary['total_images'] += len(image_paths)
+        summary['pending_images'] += pending_count
+
+        logger.info(
+            f"[自动标注] 扫描目录完成: task_dir={db_task_dir}, local={local_task_dir}, "
+            f"images={len(image_paths)}, existing_json={len(existing_json_keys)}, pending={pending_count}"
+        )
+
+        for img_path in image_paths:
+            if has_matching_labelme_json(img_path, local_task_dir, existing_json_keys):
+                dir_result['skipped_existing_count'] += 1
+                summary['skipped_existing_count'] += 1
+                continue
+
+            img = read_image_for_auto_label(img_path)
+            if img is None:
+                dir_result['unreadable_count'] += 1
+                summary['unreadable_count'] += 1
+                continue
+
+            image_height, image_width = img.shape[:2]
+            try:
+                results = model(img, conf=conf, verbose=False)
+                shapes = []
+                for result in results:
+                    boxes = getattr(result, 'boxes', None)
+                    if boxes is None:
+                        continue
+                    for box in boxes:
+                        cls_id = int(box.cls.item())
+                        if cls_id not in target_class_ids:
+                            continue
+
+                        x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0].tolist()
+                        x1 = max(0.0, min(float(x1), float(image_width - 1)))
+                        y1 = max(0.0, min(float(y1), float(image_height - 1)))
+                        x2 = max(0.0, min(float(x2), float(image_width - 1)))
+                        y2 = max(0.0, min(float(y2), float(image_height - 1)))
+                        shapes.append({
+                            "label": get_auto_label_name(model, cls_id, id_to_label),
+                            "points": [
+                                [round(x1, 2), round(y1, 2)],
+                                [round(x2, 2), round(y2, 2)],
+                            ],
+                            "group_id": None,
+                            "description": "",
+                            "shape_type": "rectangle",
+                            "flags": {},
+                        })
+
+                if not shapes:
+                    dir_result['skipped_empty_count'] += 1
+                    summary['skipped_empty_count'] += 1
+                    continue
+
+                json_path = img_path.with_suffix('.json')
+                labelme_data = build_auto_labelme_json(img_path, image_width, image_height, shapes)
+                json_path.write_text(
+                    json.dumps(labelme_data, ensure_ascii=False, indent=2),
+                    encoding='utf-8'
+                )
+
+                existing_json_keys.add(img_path.relative_to(local_task_dir).with_suffix('').as_posix())
+                image_db_path = map_label_task_path_to_db(str(img_path))
+                json_db_path = map_label_task_path_to_db(str(json_path))
+                record = {
+                    'image_name': img_path.name,
+                    'image_path': str(img_path),
+                    'image_db_path': image_db_path,
+                    'json_path': str(json_path),
+                    'json_db_path': json_db_path,
+                    'shape_count': len(shapes),
+                }
+                summary['generated_records'].append(record)
+                dir_result['generated_count'] += 1
+                summary['generated_count'] += 1
+            except Exception as e:
+                dir_result['failed_count'] += 1
+                summary['failed_count'] += 1
+                summary['failed_images'].append({'image_path': str(img_path), 'error': str(e)})
+                logger.error(f"[自动标注] 图片处理失败: image={img_path}, error={str(e)}")
+
+    return summary
+
+
+@app.route('/algorithm/dataset/auto-label', methods=['POST'])
+def auto_label_dataset():
+    """对标注任务目录中尚无 JSON 的图片执行模型预标注。"""
+    lock_acquired = False
+    label_task_id = None
+    try:
+        data = request.get_json(silent=True) or {}
+        required_fields = ('label_task_id', 'model_id', 'conf', 'classes')
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({
+                "code": 1,
+                "data": {"message": f"缺少必需参数: {', '.join(missing_fields)}"}
+            }), 400
+
+        try:
+            label_task_id = validate_positive_id(data.get('label_task_id'), "label_task_id")
+            model_id = validate_positive_id(data.get('model_id'), "model_id")
+        except ValidationError as e:
+            return jsonify({"code": 1, "data": {"message": str(e)}}), 400
+
+        try:
+            conf = float(data.get('conf'))
+        except (TypeError, ValueError):
+            return jsonify({"code": 1, "data": {"message": "conf必须是数字"}}), 400
+        if conf <= 0 or conf > 1:
+            return jsonify({"code": 1, "data": {"message": "conf必须大于0且小于等于1"}}), 400
+
+        lock_created, redis_key, redis_message = auto_label_redis_manager.start_task(
+            label_task_id=label_task_id,
+            model_id=model_id,
+            conf=conf,
+            classes=data.get('classes')
+        )
+        if not lock_created:
+            if redis_key:
+                return jsonify({
+                    "code": 1,
+                    "data": {
+                        "message": "自动标注任务正在进行中，请勿重复提交",
+                        "label_task_id": label_task_id,
+                        "redis_key": redis_key,
+                        "current": redis_message
+                    }
+                }), 409
+            return jsonify({
+                "code": 1,
+                "data": {
+                    "message": redis_message or "创建自动标注状态key失败",
+                    "label_task_id": label_task_id
+                }
+            }), 500
+        lock_acquired = True
+
+        assignee_rows = db_manager.get_label_task_assignee_dirs(label_task_id)
+        if assignee_rows is None:
+            return jsonify({"code": 1, "data": {"message": "查询标注任务分配目录失败"}}), 500
+
+        task_dirs = []
+        seen_dirs = set()
+        for row in assignee_rows:
+            task_dir = normalize_posix_path(row.get('task_dir'))
+            if task_dir and task_dir not in seen_dirs:
+                task_dirs.append(task_dir)
+                seen_dirs.add(task_dir)
+        if not task_dirs:
+            return jsonify({
+                "code": 1,
+                "data": {"message": f"未找到label_task_id={label_task_id}的task_dir"}
+            }), 404
+
+        weight_info = db_manager.get_trained_weight_for_auto_label(model_id)
+        if not weight_info:
+            return jsonify({"code": 1, "data": {"message": f"未找到model_id={model_id}的训练权重记录"}}), 404
+
+        model_storage_address = weight_info.get('bestmodel_address')
+        if not model_storage_address:
+            return jsonify({"code": 1, "data": {"message": f"model_id={model_id}缺少bestmodel_address"}}), 400
+
+        local_model_path = Path(ensure_local_path(model_storage_address))
+        if not local_model_path.exists():
+            return jsonify({"code": 1, "data": {"message": f"模型文件不存在: {local_model_path}"}}), 400
+
+        logger.info(
+            f"[自动标注] 收到请求: label_task_id={label_task_id}, model_id={model_id}, "
+            f"conf={conf}, task_dir_count={len(task_dirs)}, model={local_model_path}"
+        )
+
+        model = YOLO(str(local_model_path))
+        class_mapping = parse_trained_class_mapping(weight_info.get('class'))
+        if not class_mapping:
+            class_mapping = build_model_class_mapping_from_yolo(model)
+        try:
+            target_class_ids, requested_classes = resolve_auto_label_target_class_ids(
+                data.get('classes'),
+                class_mapping
+            )
+        except ValueError as e:
+            return jsonify({"code": 1, "data": {"message": str(e)}}), 400
+
+        result = run_auto_label_for_task_dirs(
+            model=model,
+            task_dirs=task_dirs,
+            conf=conf,
+            target_class_ids=target_class_ids,
+            class_mapping=class_mapping
+        )
+
+        update_result = db_manager.update_auto_label_items(
+            label_task_id,
+            result['generated_records']
+        )
+        if update_result is None:
+            return jsonify({"code": 1, "data": {"message": "自动标注完成，但写回label_task_item失败"}}), 500
+
+        response_data = {
+            "message": "自动标注完成",
+            "label_task_id": label_task_id,
+            "model_id": model_id,
+            "conf": conf,
+            "classes": requested_classes,
+            "target_class_ids": sorted(target_class_ids),
+            "task_dir_count": result['task_dir_count'],
+            "total_images": result['total_images'],
+            "pending_images": result['pending_images'],
+            "generated_count": result['generated_count'],
+            "updated_count": update_result['updated_count'],
+            "skipped_existing_count": result['skipped_existing_count'],
+            "skipped_empty_count": result['skipped_empty_count'],
+            "unreadable_count": result['unreadable_count'],
+            "failed_count": result['failed_count'],
+            "task_dirs": result['task_dirs'],
+            "missing_items": update_result['missing_items'][:50],
+            "failed_images": result['failed_images'][:50],
+            "generated_records": result['generated_records'][:50],
+            "redis_key": redis_key,
+        }
+        return jsonify({"code": 0, "data": response_data})
+    except FileNotFoundError as e:
+        logger.error(f"[自动标注] 路径不存在: {str(e)}")
+        return jsonify({"code": 1, "data": {"message": f"路径不存在: {str(e)}"}}), 404
+    except Exception as e:
+        return handle_api_exception(e, "自动标注")
+    finally:
+        if lock_acquired and label_task_id is not None:
+            auto_label_redis_manager.finish_task(label_task_id)
 
 
 @app.route('/algorithm/train/predict', methods=['POST'])
@@ -6399,6 +7047,7 @@ def predict_with_model():
                     cap = None
                     writer = None
                     ffmpeg_proc = None
+                    ffmpeg_stderr_file = None
                     try:
                         logger.info(f"[异步推理] 开始处理视频: {video_path.name}")
                         cap = cv2.VideoCapture(str(video_path))
@@ -6439,6 +7088,9 @@ def predict_with_model():
                         if use_ffmpeg:
                             target_w = width - (width % 2)
                             target_h = height - (height % 2)
+                            # stderr 落临时文件而非 PIPE：逐帧写 stdin 的同时若不持续读 stderr，
+                            # ffmpeg 的 stderr 写满管道缓冲后会阻塞，与我们等待写 stdin 形成死锁。
+                            ffmpeg_stderr_file = tempfile.TemporaryFile()
                             ffmpeg_proc = subprocess.Popen(
                                 [
                                     ffmpeg_bin, '-y', '-loglevel', 'error',
@@ -6455,7 +7107,7 @@ def predict_with_model():
                                     str(result_video_path),
                                 ],
                                 stdin=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
+                                stderr=ffmpeg_stderr_file,
                             )
                         else:
                             target_w, target_h = width, height
@@ -6476,7 +7128,7 @@ def predict_with_model():
                                 try:
                                     ffmpeg_proc.stdin.write(annotated.tobytes())
                                 except BrokenPipeError:
-                                    err_msg = ffmpeg_proc.stderr.read().decode('utf-8', errors='replace') if ffmpeg_proc.stderr else ''
+                                    err_msg = _read_ffmpeg_stderr(ffmpeg_stderr_file)
                                     logger.error(f"[异步推理] ffmpeg 编码中断: {err_msg}")
                                     break
                             else:
@@ -6502,12 +7154,17 @@ def predict_with_model():
                             try:
                                 returncode = ffmpeg_proc.wait(timeout=60)
                                 if returncode != 0:
-                                    err_msg = ffmpeg_proc.stderr.read().decode('utf-8', errors='replace') if ffmpeg_proc.stderr else ''
+                                    err_msg = _read_ffmpeg_stderr(ffmpeg_stderr_file)
                                     logger.error(f"[异步推理] ffmpeg 退出码 {returncode}: {err_msg.strip()}")
                             except subprocess.TimeoutExpired:
                                 ffmpeg_proc.kill()
                                 ffmpeg_proc.wait()
                                 logger.error(f"[异步推理] ffmpeg 超时被强制终止: {video_path.name}")
+                        if ffmpeg_stderr_file is not None:
+                            try:
+                                ffmpeg_stderr_file.close()
+                            except Exception:
+                                pass
 
                 logger.info(f"[异步推理] 推理完成，结果保存到: {local_results_path}")
 
@@ -6525,8 +7182,7 @@ def predict_with_model():
                             actual_results_path = subdirs[0]
 
                 results_object_prefix = parse_storage_relative_path(results_storage_dir)
-                delete_storage_prefix(results_object_prefix)
-                success_count, fail_count, failed_files = upload_directory_to_storage(
+                success_count, fail_count, failed_files = persist_directory_to_storage(
                     actual_results_path,
                     results_object_prefix
                 )
