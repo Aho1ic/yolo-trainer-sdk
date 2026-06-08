@@ -22,7 +22,7 @@ import random
 import shlex
 import tempfile
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime
 import threading
 import time
@@ -33,6 +33,8 @@ import traceback
 import urllib.error
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import torch
 from ultralytics import YOLO
 from config import TrainerConfig
@@ -294,6 +296,15 @@ DATASET_BUILD_PROGRESS_SECONDS_INTERVAL = 5
 STORAGE_OBJECT_KEY_PREFIX = os.environ.get('TRAINER_STORAGE_OBJECT_KEY_PREFIX', 'algorithm/trainer')
 LABEL_TASK_STORAGE_DB_PREFIX = os.environ.get('LABEL_TASK_STORAGE_DB_PREFIX', '/app/storage/task')
 LABEL_TASK_STORAGE_LOCAL_PREFIX = os.environ.get('LABEL_TASK_STORAGE_LOCAL_PREFIX', '/volume2/task')
+AUTO_LABEL_BATCH_SIZE = max(1, int(os.environ.get('AUTO_LABEL_BATCH_SIZE', '16')))
+AUTO_LABEL_SMB_READ_WORKERS = max(1, int(os.environ.get('AUTO_LABEL_SMB_READ_WORKERS', '4')))
+AUTO_LABEL_SMB_ENABLED = os.environ.get('AUTO_LABEL_SMB_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+AUTO_LABEL_SMB_HOST = os.environ.get('AUTO_LABEL_SMB_HOST') or os.environ.get('NAS_HOST') or '192.168.0.174'
+AUTO_LABEL_SMB_SHARE = os.environ.get('AUTO_LABEL_SMB_SHARE') or os.environ.get('NAS_SHARE', 'task')
+AUTO_LABEL_SMB_USER = os.environ.get('AUTO_LABEL_SMB_USER') or os.environ.get('NAS_USER') or 'liyuxuan'
+AUTO_LABEL_SMB_PASSWORD = os.environ.get('AUTO_LABEL_SMB_PASSWORD') or os.environ.get('NAS_PASSWORD')
+AUTO_LABEL_SMB_DOMAIN = os.environ.get('AUTO_LABEL_SMB_DOMAIN') or None
+AUTO_LABEL_SMB_REMOTE_PREFIX = os.environ.get('AUTO_LABEL_SMB_REMOTE_PREFIX', LABEL_TASK_STORAGE_LOCAL_PREFIX)
 AUTO_LABEL_REDIS_LOCK_TTL_SECONDS = int(os.environ.get('AUTO_LABEL_REDIS_LOCK_TTL_SECONDS', '604800'))
 MODEL_CONVERT_CONTAINER_ID = os.environ.get('MODEL_CONVERT_CONTAINER_ID', '96350d6935d8')
 MODEL_CONVERT_CONTAINER_WORKDIR = os.environ.get('MODEL_CONVERT_CONTAINER_WORKDIR', '/workspace')
@@ -442,6 +453,12 @@ def copy_file_to_storage(local_path: Path, target_path: str):
     """复制文件到存储目录"""
     local_path = Path(local_path)
     target = _resolve_path(str(target_path))
+    try:
+        if local_path.resolve() == target.resolve():
+            logger.debug(f"文件已在目标路径，无需复制: {local_path}")
+            return str(target)
+    except FileNotFoundError:
+        pass
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(local_path), str(target))
     logger.debug(f"文件复制成功: {local_path} -> {target}")
@@ -876,6 +893,28 @@ def format_percentage_dict(counter_dict, total_count):
     return percentage_dict
 
 
+def build_dataset_label_rows(label_order, tag_num, tag_percentage, label_cover_map, data_type):
+    """构建 train_dataset_label 写库行。"""
+    label_rows = []
+    for label_name in label_order:
+        percentage_str = tag_percentage.get(label_name, '0%')
+        proportion = round(float(percentage_str.replace('%', '')), 2) if percentage_str else 0.0
+        label_rows.append({
+            'label_name': label_name,
+            'tag_num': tag_num[label_name],
+            'proportion': proportion,
+            'data_type': data_type,
+            'object_key': label_cover_map.get(label_name)
+        })
+    return label_rows
+
+
+def build_split_image_db_object_key(dataset_id, split_name, image_object):
+    return build_storage_db_object_key(
+        'original_dataset', str(dataset_id), split_name, 'images', Path(image_object).name
+    )
+
+
 def resolve_split_annotation_prefix(dataset_id, split_name):
     """返回 stats 使用的 split 标注目录，兼容 json/jsons。"""
     split_prefix = build_storage_object_key('original_dataset', str(dataset_id), split_name)
@@ -951,6 +990,9 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
     label_counter = Counter()
     label_order = []
     label_cover_map = {}
+    keypoint_counter = Counter()
+    keypoint_label_order = []
+    keypoint_cover_map = {}
     shape_types = []
     # pose 相关：每个矩形对应的关键点标签集合 + 整个 split 出现过的关键点标签
     keypoint_labels_in_split = []  # 保留首次出现顺序
@@ -978,6 +1020,19 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
             if kp_label not in keypoint_labels_in_split:
                 keypoint_labels_in_split.append(kp_label)
 
+        valid_keypoint_labels_in_file = []
+        for keypoints_by_label in assignment.keypoints_by_rect:
+            for kp_label in keypoints_by_label.keys():
+                if kp_label not in keypoint_counter:
+                    keypoint_label_order.append(kp_label)
+                keypoint_counter[kp_label] += 1
+                valid_keypoint_labels_in_file.append(kp_label)
+
+        if valid_keypoint_labels_in_file and stem in image_objects:
+            object_key = build_split_image_db_object_key(dataset_id, split_name, image_objects[stem])
+            for kp_label in dict.fromkeys(valid_keypoint_labels_in_file):
+                keypoint_cover_map.setdefault(kp_label, object_key)
+
         if assignment.unassigned_points:
             logger.warning(
                 f"{json_object} 存在 {len(assignment.unassigned_points)} 个框外 point，"
@@ -991,31 +1046,34 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
 
     for stem, json_object, shapes, assignment in parsed_entries:
         labels_in_file = []
-        for shape in shapes:
-            label_name = str(shape.get('label') or '').strip()
-            if not label_name:
-                continue
+        if split_has_point:
+            # point/pose 数据集只把“至少包含一个关键点的 rectangle”作为目标类别。
+            # 无关键点矩形不会进入 YOLO pose TXT，统计阶段也必须保持同一口径。
+            for rect, keypoints_by_label in zip(assignment.rectangles, assignment.keypoints_by_rect):
+                if not keypoints_by_label:
+                    continue
+                label_name = rect.label
+                if label_name not in label_counter:
+                    label_order.append(label_name)
+                label_counter[label_name] += 1
+                labels_in_file.append(label_name)
+        else:
+            for shape in shapes:
+                label_name = str(shape.get('label') or '').strip()
+                if not label_name:
+                    continue
 
-            shape_type = infer_shape_type(shape)
+                shape_type = infer_shape_type(shape)
+                if shape_type == 'point':
+                    continue
 
-            # point 类型不计入"类别"统计，而是作为关键点标签收集
-            if shape_type == 'point':
-                continue
-
-            # 一旦 split 中出现 point，整体按 pose 数据处理：仅 rectangle 作为目标类别。
-            # polygon 等形状不参与 pose 类别统计，也不会进入 YOLO pose TXT。
-            if split_has_point and shape_type != 'rectangle':
-                continue
-
-            if label_name not in label_counter:
-                label_order.append(label_name)
-            label_counter[label_name] += 1
-            labels_in_file.append(label_name)
+                if label_name not in label_counter:
+                    label_order.append(label_name)
+                label_counter[label_name] += 1
+                labels_in_file.append(label_name)
 
         if labels_in_file and stem in image_objects:
-            object_key = build_storage_db_object_key(
-                'original_dataset', str(dataset_id), split_name, 'images', Path(image_objects[stem]).name
-            )
+            object_key = build_split_image_db_object_key(dataset_id, split_name, image_objects[stem])
             for label_name in dict.fromkeys(labels_in_file):
                 label_cover_map.setdefault(label_name, object_key)
 
@@ -1023,17 +1081,22 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
     tag_sum = sum(ordered_tag_num.values())
     tag_percentage = format_percentage_dict(ordered_tag_num, tag_sum)
 
-    label_rows = []
-    for label_name in label_order:
-        percentage_str = tag_percentage.get(label_name, '0%')
-        proportion = round(float(percentage_str.replace('%', '')), 2) if percentage_str else 0.0
-        label_rows.append({
-            'label_name': label_name,
-            'tag_num': ordered_tag_num[label_name],
-            'proportion': proportion,
-            'data_type': data_type,
-            'object_key': label_cover_map.get(label_name)
-        })
+    keypoint_label_order = sort_keypoint_labels(keypoint_label_order)
+    keypoint_tag_num = {
+        label_name: keypoint_counter[label_name]
+        for label_name in keypoint_label_order
+    }
+    keypoint_tag_sum = sum(keypoint_tag_num.values())
+    keypoint_tag_percentage = format_percentage_dict(keypoint_tag_num, keypoint_tag_sum)
+
+    label_rows = build_dataset_label_rows(label_order, ordered_tag_num, tag_percentage, label_cover_map, data_type)
+    keypoint_label_rows = build_dataset_label_rows(
+        keypoint_label_order,
+        keypoint_tag_num,
+        keypoint_tag_percentage,
+        keypoint_cover_map,
+        data_type
+    )
 
     return {
         'split_name': split_name,
@@ -1047,6 +1110,10 @@ def repair_and_collect_split_stats(dataset_id, split_name, data_type):
         'label_order': label_order,
         'label_rows': label_rows,
         'keypoint_labels': keypoint_labels_in_split,
+        'keypoint_tag_sum': keypoint_tag_sum,
+        'keypoint_tag_num': keypoint_tag_num,
+        'keypoint_tag_percentage': keypoint_tag_percentage,
+        'keypoint_label_rows': keypoint_label_rows,
         'repair': {
             'removed_json_files': removed_json_files,
             'created_negative_json_files': created_negative_json_files,
@@ -1108,6 +1175,24 @@ def normalize_label_mapping(label_mapping):
     return normalized_mapping
 
 
+def build_dataset_file_object_key_candidates(json_object):
+    """构造 train_dataset_file.object_key 的兼容匹配候选。"""
+    raw_object_key = str(json_object or '').strip().replace('\\', '/').lstrip('/')
+    normalized_object_key = normalize_storage_path_for_db(raw_object_key)
+
+    candidates = []
+    for candidate in (
+        normalized_object_key,
+        raw_object_key,
+        f"/{normalized_object_key}" if normalized_object_key else None,
+        f"/{raw_object_key}" if raw_object_key else None,
+    ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    return candidates
+
+
 def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
     """基于本地路径批量修改单个 split/json 目录中的标签，可按 shape_type 过滤"""
     json_prefix = build_storage_object_key('original_dataset', str(dataset_id), split_name, 'json')
@@ -1127,10 +1212,12 @@ def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
         'json_prefix': json_prefix,
         'total_files': len(json_objects),
         'modified_files': 0,
+        'db_updated_files': 0,
         'renamed_shapes': 0,
         'deleted_shapes': 0,
         'operation_stats': operation_stats,
-        'failed_files': []
+        'failed_files': [],
+        'db_update_failed_files': []
     }
 
     for json_object in json_objects:
@@ -1154,6 +1241,8 @@ def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
                 config = label_mapping[shape_label]
                 shape_type_filter = config['shape_type_filter']
                 shape_type_value = str(shape.get('shape_type') or '').strip().lower()
+                if not shape_type_value:
+                    shape_type_value = infer_shape_type(shape)
                 if shape_type_filter is not None and shape_type_value != shape_type_filter:
                     updated_shapes.append(shape)
                     continue
@@ -1175,7 +1264,21 @@ def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
 
             if file_modified:
                 data['shapes'] = updated_shapes
+                json_content = json.dumps(data, ensure_ascii=False, indent=2)
                 put_storage_json_object(json_object, data)
+                update_result = db_manager.update_dataset_file_json_content(
+                    dataset_id=dataset_id,
+                    object_key_candidates=build_dataset_file_object_key_candidates(json_object),
+                    json_content=json_content
+                )
+                if not update_result.get('success'):
+                    result['db_update_failed_files'].append({
+                        'file': json_object,
+                        'object_key_candidates': update_result.get('object_key_candidates', []),
+                        'error': update_result.get('error') or '未找到对应train_dataset_file记录'
+                    })
+                else:
+                    result['db_updated_files'] += update_result.get('updated_count', 0)
                 result['modified_files'] += 1
 
         except Exception as e:
@@ -1185,7 +1288,8 @@ def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
                 'error': str(e)
             })
 
-    result['failed_count'] = len(result['failed_files'])
+    result['db_update_failed_count'] = len(result['db_update_failed_files'])
+    result['failed_count'] = len(result['failed_files']) + result['db_update_failed_count']
     result['unmatched_labels'] = [
         old_label for old_label, stats in operation_stats.items()
         if stats['matched_shapes'] == 0
@@ -1194,8 +1298,11 @@ def batch_modify_labels_in_split(dataset_id, split_name, label_mapping):
     return result
 
 
-def collect_dataset_stats_result(dataset_id):
+def collect_dataset_stats_result(dataset_id, dataset_info=None):
     """执行数据集统计并同步更新数据库"""
+    if dataset_info is None:
+        dataset_info = db_manager.get_dataset_full_info(dataset_id) or {}
+
     train_stats = repair_and_collect_split_stats(dataset_id, 'train', 1)
     val_stats = repair_and_collect_split_stats(dataset_id, 'valid', 2)
 
@@ -1211,7 +1318,15 @@ def collect_dataset_stats_result(dataset_id):
     total_tag_num = {label_name: combined_label_counter[label_name] for label_name in combined_label_order}
     total_tag_sum = sum(total_tag_num.values())
     total_tag_percentage = format_percentage_dict(total_tag_num, total_tag_sum)
-    draw_type = merge_draw_types([train_stats['draw_type'], val_stats['draw_type']])
+    detected_draw_type = merge_draw_types([train_stats['draw_type'], val_stats['draw_type']])
+    dataset_duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+    dataset_draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
+    is_pose_dataset = (
+        dataset_duty_type == 'pose'
+        or dataset_draw_type == 'point'
+        or detected_draw_type == 'point'
+    )
+    draw_type = 'point' if is_pose_dataset else detected_draw_type
 
     sample_num = train_stats['sample_num'] + val_stats['sample_num']
     annotation_num = train_stats['annotation_num'] + val_stats['annotation_num']
@@ -1226,7 +1341,6 @@ def collect_dataset_stats_result(dataset_id):
     # 数字化关键点标签（"1","2","3"）按数值排序，保证 1<2<3 的稳定顺序
     keypoint_labels = sort_keypoint_labels(keypoint_labels)
     kpt_num = len(keypoint_labels)
-    is_pose_dataset = draw_type == 'point'
 
     if not db_manager.update_dataset_class_mapping(dataset_id, class_mapping):
         raise RuntimeError("更新train_dataset.class失败")
@@ -1257,7 +1371,10 @@ def collect_dataset_stats_result(dataset_id):
     ):
         raise RuntimeError("更新train_dataset聚合统计字段失败")
 
+    # train_dataset.labels/class/tag_num 和 train_dataset_label 都使用目标框类别统计；
+    # point 标签只作为 pose 的关键点顺序写入 kpt_labels/kpt_num。
     label_rows = train_stats['label_rows'] + val_stats['label_rows']
+
     success_count, fail_count = db_manager.insert_dataset_labels(dataset_id, label_rows)
     if fail_count > 0:
         raise RuntimeError(
@@ -1267,7 +1384,10 @@ def collect_dataset_stats_result(dataset_id):
     return {
         'dataset_id': dataset_id,
         'label_num': len(combined_label_order),
+        'stats_label_type': 'class',
+        'stats_label_num': len(combined_label_order),
         'draw_type': draw_type,
+        'detected_draw_type': detected_draw_type,
         'class_mapping': class_mapping,
         'kpt_num': kpt_num,
         'keypoint_labels': keypoint_labels,
@@ -1277,6 +1397,12 @@ def collect_dataset_stats_result(dataset_id):
             'tag_sum': train_stats['tag_sum'],
             'tag_num': train_stats['tag_num'],
             'tag_percentage': train_stats['tag_percentage'],
+            'class_tag_sum': train_stats['tag_sum'],
+            'class_tag_num': train_stats['tag_num'],
+            'class_tag_percentage': train_stats['tag_percentage'],
+            'keypoint_tag_sum': train_stats['keypoint_tag_sum'],
+            'keypoint_tag_num': train_stats['keypoint_tag_num'],
+            'keypoint_tag_percentage': train_stats['keypoint_tag_percentage'],
             'repair': train_stats['repair']
         },
         'valid_stats': {
@@ -1285,6 +1411,12 @@ def collect_dataset_stats_result(dataset_id):
             'tag_sum': val_stats['tag_sum'],
             'tag_num': val_stats['tag_num'],
             'tag_percentage': val_stats['tag_percentage'],
+            'class_tag_sum': val_stats['tag_sum'],
+            'class_tag_num': val_stats['tag_num'],
+            'class_tag_percentage': val_stats['tag_percentage'],
+            'keypoint_tag_sum': val_stats['keypoint_tag_sum'],
+            'keypoint_tag_num': val_stats['keypoint_tag_num'],
+            'keypoint_tag_percentage': val_stats['keypoint_tag_percentage'],
             'repair': val_stats['repair']
         },
         'label_rows': len(label_rows),
@@ -1292,6 +1424,80 @@ def collect_dataset_stats_result(dataset_id):
             'train': train_stats['split_dir'],
             'valid': val_stats['split_dir']
         }
+    }
+
+
+def _dataset_pose_stats_fields_complete(dataset_info):
+    """pose/point 数据集需要 kpt_labels 与 kpt_num 一致，才算统计字段完整。"""
+    dataset_duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+    dataset_draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
+    if dataset_duty_type != 'pose' and dataset_draw_type != 'point':
+        return True
+
+    db_kpt_labels = parse_json_array_field(dataset_info.get('kpt_labels'))
+    try:
+        db_kpt_num = int(dataset_info.get('kpt_num') or 0)
+    except (TypeError, ValueError):
+        db_kpt_num = 0
+    return bool(db_kpt_labels and db_kpt_num == len(db_kpt_labels))
+
+
+def ensure_dataset_stats_current(dataset_id, dataset_info=None, force_stats=False):
+    """确保 original_dataset/{dataset_id} 已完成统计；目录未变且字段完整时跳过。"""
+    if dataset_info is None:
+        dataset_info = db_manager.get_dataset_full_info(dataset_id)
+    if not dataset_info:
+        raise ValueError(f"未找到dataset_id={dataset_id}的数据集信息")
+
+    previous_hash_info = db_manager.get_dataset_original_hash_info(dataset_id) or {}
+    previous_hash = previous_hash_info.get('hash')
+    previous_hash_schema = previous_hash_info.get('schema')
+    try:
+        current_hash = compute_original_dataset_hash(dataset_id)
+    except Exception as e:
+        logger.warning(f"计算original_dataset目录哈希失败,继续执行统计: dataset_id={dataset_id}, error={str(e)}")
+        current_hash = None
+
+    pose_fields_complete = _dataset_pose_stats_fields_complete(dataset_info)
+    if (
+        not force_stats
+        and current_hash
+        and previous_hash
+        and current_hash == previous_hash
+        and (not previous_hash_schema or previous_hash_schema == ORIGINAL_DATASET_HASH_SCHEMA_VERSION)
+        and pose_fields_complete
+    ):
+        logger.info(
+            f"original_dataset目录哈希未变,跳过数据集统计: dataset_id={dataset_id}, hash={current_hash}"
+        )
+        return {
+            "message": "原始数据集目录未变更,跳过统计",
+            "dataset_id": dataset_id,
+            "skipped": True,
+            "original_dataset_hash": current_hash,
+            "original_dataset_hash_schema": ORIGINAL_DATASET_HASH_SCHEMA_VERSION
+        }
+
+    stats_result = collect_dataset_stats_result(dataset_id, dataset_info=dataset_info)
+
+    # stats 阶段会修改目录(补负样本 json、删除孤立 json),统计完成后重新计算并写库
+    try:
+        new_hash = compute_original_dataset_hash(dataset_id)
+        if new_hash:
+            db_manager.update_dataset_original_hash(
+                dataset_id,
+                new_hash,
+                schema_version=ORIGINAL_DATASET_HASH_SCHEMA_VERSION,
+            )
+            stats_result['original_dataset_hash'] = new_hash
+            stats_result['original_dataset_hash_schema'] = ORIGINAL_DATASET_HASH_SCHEMA_VERSION
+    except Exception as e:
+        logger.warning(f"统计完成后写入original_dataset_hash失败: dataset_id={dataset_id}, error={str(e)}")
+
+    return {
+        "message": "数据集统计完成",
+        "skipped": False,
+        **stats_result
     }
 
 
@@ -2106,6 +2312,75 @@ class TrainerDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"查询数据集完整信息失败: {str(e)}")
             return None
+        finally:
+            connection.close()
+
+    def update_dataset_file_json_content(self, dataset_id, object_key_candidates, json_content):
+        """同步更新 train_dataset_file 中修改后的 JSON 内容。"""
+        candidates = []
+        for object_key in object_key_candidates or []:
+            normalized_key = str(object_key or '').strip().replace('\\', '/')
+            if normalized_key and normalized_key not in candidates:
+                candidates.append(normalized_key)
+
+        if not candidates:
+            return {
+                'success': False,
+                'object_key_candidates': [],
+                'error': 'object_key候选为空'
+            }
+
+        connection = self.get_connection()
+        if not connection:
+            return {
+                'success': False,
+                'object_key_candidates': candidates,
+                'error': '数据库连接失败'
+            }
+
+        try:
+            with connection.cursor() as cursor:
+                placeholders = ', '.join(['%s'] * len(candidates))
+                sql = f"""UPDATE train_dataset_file
+                         SET json_content = %s,
+                             update_time = NOW()
+                         WHERE dataset_id = %s
+                           AND object_key IN ({placeholders})
+                           AND deleted = b'0'"""
+                cursor.execute(sql, (json_content, dataset_id, *candidates))
+                connection.commit()
+
+                if cursor.rowcount <= 0:
+                    logger.warning(
+                        f"更新train_dataset_file.json_content未匹配到记录: "
+                        f"dataset_id={dataset_id}, object_key_candidates={candidates}"
+                    )
+                    return {
+                        'success': False,
+                        'object_key_candidates': candidates,
+                        'error': '未找到对应train_dataset_file记录'
+                    }
+
+                logger.info(
+                    f"更新train_dataset_file.json_content成功: "
+                    f"dataset_id={dataset_id}, updated_count={cursor.rowcount}, object_key={candidates[0]}"
+                )
+                return {
+                    'success': True,
+                    'object_key_candidates': candidates,
+                    'updated_count': cursor.rowcount
+                }
+        except Exception as e:
+            connection.rollback()
+            logger.error(
+                f"更新train_dataset_file.json_content失败: "
+                f"dataset_id={dataset_id}, object_key_candidates={candidates}, error={str(e)}"
+            )
+            return {
+                'success': False,
+                'object_key_candidates': candidates,
+                'error': str(e)
+            }
         finally:
             connection.close()
 
@@ -3356,7 +3631,10 @@ class TrainerDatabaseManager(BaseDatabaseManager):
                             logger.info(f"best.pt文件大小: {file_size_mb} MB")
                     except Exception as e:
                         logger.warning(f"获取best.pt文件大小失败: {str(e)}")
-                weights_id = snowflake_generator.generate_id()
+                # 业务侧要求 trained_weights.id 沿用表内最大 ID 递增，而不是雪花 ID。
+                cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM trained_weights FOR UPDATE")
+                next_id_row = cursor.fetchone() or {}
+                weights_id = int(next_id_row.get('next_id') or 1)
                 
                 if labels_value is not None:
                     if isinstance(labels_value, str):
@@ -3626,6 +3904,30 @@ class TrainingManager:
             return False, error_msg
 
         return True, None
+
+    def _ensure_dataset_stats_before_training(self, dataset_id, dataset_info):
+        """训练启动前确保数据集统计已完成，已统计且目录未变时自动跳过。"""
+        dataset_lock = get_dataset_lock(dataset_id)
+        logger.info(f"训练启动前检查数据集统计状态: dataset_id={dataset_id}")
+        if not dataset_lock.acquire(timeout=600):
+            return False, "等待数据集处理锁超时，无法在训练前完成数据集统计", dataset_info
+
+        try:
+            stats_result = ensure_dataset_stats_current(dataset_id, dataset_info=dataset_info)
+            if stats_result.get('skipped'):
+                logger.info(f"训练启动前数据集统计已是最新，跳过: dataset_id={dataset_id}")
+            else:
+                logger.info(f"训练启动前数据集统计完成: dataset_id={dataset_id}")
+        except Exception as e:
+            logger.error(f"训练启动前数据集统计失败: dataset_id={dataset_id}, error={str(e)}")
+            return False, f"训练启动前数据集统计失败: {str(e)}", dataset_info
+        finally:
+            dataset_lock.release()
+
+        refreshed_dataset_info = self.db_manager.get_dataset_full_info(dataset_id)
+        if not refreshed_dataset_info:
+            return False, f"未找到dataset_id={dataset_id}的数据集信息", dataset_info
+        return True, None, refreshed_dataset_info
     
     def build_command(self, task_params, task_id=None):
         """已废弃：训练不再通过 trainer.py CLI 子进程启动。"""
@@ -3660,7 +3962,24 @@ class TrainingManager:
                 except (TypeError, ValueError):
                     kpt_num = 0
 
+            task_duty_type = str(task_params.get('duty_type', 'detect') or 'detect').strip().lower()
+            effective_duty_type = task_duty_type
+            if dataset_info:
+                dataset_duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+                dataset_draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
+                if dataset_duty_type in {'detect', 'segment', 'pose'}:
+                    effective_duty_type = dataset_duty_type
+                if dataset_draw_type == 'point':
+                    effective_duty_type = 'pose'
+                if effective_duty_type != task_duty_type:
+                    logger.warning(
+                        f"训练任务类型与数据集类型不一致，使用数据集类型: "
+                        f"task_duty_type={task_duty_type}, dataset_duty_type={dataset_duty_type}, "
+                        f"draw_type={dataset_draw_type}, effective_duty_type={effective_duty_type}"
+                    )
+
             logger.info(f"最终yaml_path: {yaml_path}")
+            logger.info(f"最终dutyType: {effective_duty_type}")
             logger.info(f"=== 构建训练参数调试结束 ===")
 
             train_results_path = build_storage_local_path("train_results", require_exists=False)
@@ -3668,7 +3987,7 @@ class TrainingManager:
             experiment_name = str(task_id) if task_id else str(task_params.get('id', 'exp'))
 
             train_params = {
-                'dutyType': str(task_params.get('duty_type', 'detect')),
+                'dutyType': effective_duty_type,
                 'model_type': int(task_params.get('model_type', 0)),
                 'model_size': str(task_params.get('model_size', 'n')),
                 'incremental_model_address': str(resolve_storage_path_to_local(task_params.get('incremental_model_address')) or ''),
@@ -3763,13 +4082,30 @@ class TrainingManager:
             
             dataset_info = None
             if task_params.get('dataset_id'):
-                ready, wait_message = self._wait_for_dataset_ready(task_params.get('dataset_id'))
+                dataset_id = task_params.get('dataset_id')
+                ready, wait_message = self._wait_for_dataset_ready(dataset_id)
                 if not ready:
                     logger.error(wait_message)
                     self._release_training_reservation(task_id)
                     reservation_active = False
                     return False, wait_message
-                dataset_info = self.db_manager.get_dataset_full_info(task_params.get('dataset_id'))
+                dataset_info = self.db_manager.get_dataset_full_info(dataset_id)
+                if not dataset_info:
+                    error_msg = f"未找到dataset_id={dataset_id}的数据集信息"
+                    logger.error(error_msg)
+                    self._release_training_reservation(task_id)
+                    reservation_active = False
+                    return False, error_msg
+
+                stats_ready, stats_message, dataset_info = self._ensure_dataset_stats_before_training(
+                    dataset_id,
+                    dataset_info,
+                )
+                if not stats_ready:
+                    logger.error(stats_message)
+                    self._release_training_reservation(task_id)
+                    reservation_active = False
+                    return False, stats_message
 
             train_params = self.build_training_params(task_params, dataset_info, task_id)
             if not train_params:
@@ -3919,7 +4255,10 @@ class TrainingManager:
                         # 读取并更新最终训练指标
                         final_metrics = None
                         try:
-                            final_metrics = self._get_final_metrics_from_csv(results_csv_path)
+                            final_metrics = self._get_final_metrics_from_csv(
+                                results_csv_path,
+                                duty_type=train_params.get('dutyType')
+                            )
                             if final_metrics:
                                 self.db_manager.update_task_metrics(
                                     task_id,
@@ -4076,6 +4415,56 @@ class TrainingManager:
             'lr_pg1': float(row.get('lr/pg1', 0)) if row.get('lr/pg1') else None,
             'lr_pg2': float(row.get('lr/pg2', 0)) if row.get('lr/pg2') else None
         }
+
+    def _get_float_from_row(self, row, keys):
+        """从 YOLO results.csv 行中按候选列名读取 float，兼容 detect/segment/pose。"""
+        normalized_row = {
+            str(row_key).strip(): value
+            for row_key, value in row.items()
+            if row_key is not None
+        }
+        for key in keys:
+            value = row.get(key)
+            if value is None:
+                value = normalized_row.get(key)
+            if value is None:
+                continue
+            value = str(value).strip()
+            if not value:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                logger.warning(f"CSV指标字段无法转为float: key={key}, value={value}")
+        return None
+
+    def _extract_final_metrics_from_row(self, row, duty_type=None):
+        duty_type = str(duty_type or '').strip().lower()
+        suffix_priority = {
+            'pose': ('P', 'B', 'M'),
+            'segment': ('M', 'B', 'P'),
+            'detect': ('B', 'M', 'P'),
+        }.get(duty_type, ('B', 'M', 'P'))
+
+        precision = self._get_float_from_row(
+            row,
+            tuple(f'metrics/precision({suffix})' for suffix in suffix_priority) + ('metrics/precision',)
+        )
+        recall = self._get_float_from_row(
+            row,
+            tuple(f'metrics/recall({suffix})' for suffix in suffix_priority) + ('metrics/recall',)
+        )
+        accuracy = self._get_float_from_row(
+            row,
+            tuple(f'metrics/mAP50-95({suffix})' for suffix in suffix_priority)
+            + tuple(f'metrics/mAP50({suffix})' for suffix in suffix_priority)
+        )
+
+        return {
+            'precision': precision,
+            'recall': recall,
+            'accuracy': accuracy,
+        }
     
     def _monitor_csv_and_save(self, task_id, csv_path, stop_event, total_epochs=None):
         last_line_count = 0
@@ -4152,7 +4541,7 @@ class TrainingManager:
         except Exception as e:
             logger.error(f"最终同步CSV到数据库失败: {str(e)}")
     
-    def _get_final_metrics_from_csv(self, csv_path):
+    def _get_final_metrics_from_csv(self, csv_path, duty_type=None):
         try:
             if not csv_path.exists():
                 logger.warning(f"CSV文件不存在，无法读取最终指标: {csv_path}")
@@ -4166,19 +4555,14 @@ class TrainingManager:
                     logger.warning(f"CSV文件为空，无法读取最终指标: {csv_path}")
                     return None
                 
-                last_row = rows[-1]
-                
-                precision = float(last_row.get('metrics/precision(B)', 0)) if last_row.get('metrics/precision(B)') else None
-                recall = float(last_row.get('metrics/recall(B)', 0)) if last_row.get('metrics/recall(B)') else None
-                accuracy = float(last_row.get('metrics/mAP50-95(B)', 0)) if last_row.get('metrics/mAP50-95(B)') else None
-                
-                logger.info(f"读取最终指标: precision={precision}, recall={recall}, accuracy(mAP50-95)={accuracy}")
-                
-                return {
-                    'precision': precision,
-                    'recall': recall,
-                    'accuracy': accuracy
-                }
+                final_metrics = self._extract_final_metrics_from_row(rows[-1], duty_type=duty_type)
+                logger.info(
+                    "读取最终指标: "
+                    f"precision={final_metrics.get('precision')}, "
+                    f"recall={final_metrics.get('recall')}, "
+                    f"accuracy={final_metrics.get('accuracy')}"
+                )
+                return final_metrics
         except Exception as e:
             logger.error(f"读取最终指标失败: {str(e)}")
             return None
@@ -4608,6 +4992,7 @@ def convert_dataset_json2txt():
             return jsonify({"code": 1, "data": {"message": f"未找到dataset_id={dataset_id}的数据集信息"}}), 404
         
         duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
+        draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
         original_train_data_address = dataset_info.get('original_train_data_address')
         original_val_data_address = dataset_info.get('original_val_data_address')
         labels_str = dataset_info.get('labels')
@@ -4636,7 +5021,9 @@ def convert_dataset_json2txt():
 
         kpt_labels = None
         kpt_num = None
-        if str(duty_type).strip().lower() == 'pose':
+        is_pose = duty_type == 'pose' or draw_type == 'point'
+        effective_duty_type = 'pose' if is_pose else duty_type
+        if is_pose:
             try:
                 kpt_labels, kpt_num = resolve_pose_keypoint_config(
                     dataset_id,
@@ -4663,7 +5050,7 @@ def convert_dataset_json2txt():
                     safe_rmtree(train_labels_path)
                 
                 train_converter = UnifiedJsonConverter(
-                    duty_type=duty_type,
+                    duty_type=effective_duty_type,
                     original_train_data_address=local_train_address,
                     predefined_labels=labels_list,
                     kpt_labels=kpt_labels,
@@ -4691,7 +5078,7 @@ def convert_dataset_json2txt():
                     safe_rmtree(val_labels_path)
                 
                 val_converter = UnifiedJsonConverter(
-                    duty_type=duty_type,
+                    duty_type=effective_duty_type,
                     original_train_data_address=local_val_address,
                     predefined_labels=labels_list,
                     kpt_labels=kpt_labels,
@@ -5052,6 +5439,8 @@ def batch_modify_dataset_labels():
     try:
         split_results = []
         total_modified_files = 0
+        total_db_updated_files = 0
+        total_db_update_failed_files = 0
         total_renamed_shapes = 0
         total_deleted_shapes = 0
         total_failed_files = 0
@@ -5060,11 +5449,13 @@ def batch_modify_dataset_labels():
             split_result = batch_modify_labels_in_split(dataset_id, split_name, normalized_mapping)
             split_results.append(split_result)
             total_modified_files += split_result['modified_files']
+            total_db_updated_files += split_result.get('db_updated_files', 0)
+            total_db_update_failed_files += split_result.get('db_update_failed_count', 0)
             total_renamed_shapes += split_result['renamed_shapes']
             total_deleted_shapes += split_result['deleted_shapes']
             total_failed_files += split_result['failed_count']
 
-        stats_result = collect_dataset_stats_result(dataset_id)
+        stats_result = collect_dataset_stats_result(dataset_id, dataset_info=dataset_info)
         try:
             new_hash = compute_original_dataset_hash(dataset_id)
             if new_hash:
@@ -5086,6 +5477,8 @@ def batch_modify_dataset_labels():
                 "label_mapping": normalized_mapping,
                 "summary": {
                     "total_modified_files": total_modified_files,
+                    "total_db_updated_files": total_db_updated_files,
+                    "total_db_update_failed_files": total_db_update_failed_files,
                     "total_renamed_shapes": total_renamed_shapes,
                     "total_deleted_shapes": total_deleted_shapes,
                     "total_failed_files": total_failed_files
@@ -5129,73 +5522,16 @@ def collect_dataset_stats():
         if not dataset_info:
             return jsonify({"code": 1, "data": {"message": f"未找到dataset_id={dataset_id}的数据集信息"}}), 404
 
-        # 哈希校验:若 original_dataset/{dataset_id} 目录内容未变,跳过统计流程
         force_stats = parse_bool_param(data.get('force'), default=False)
-        previous_hash_info = db_manager.get_dataset_original_hash_info(dataset_id) or {}
-        previous_hash = previous_hash_info.get('hash')
-        previous_hash_schema = previous_hash_info.get('schema')
-        try:
-            current_hash = compute_original_dataset_hash(dataset_id)
-        except Exception as e:
-            logger.warning(f"计算original_dataset目录哈希失败,继续执行统计: dataset_id={dataset_id}, error={str(e)}")
-            current_hash = None
-
-        pose_fields_complete = True
-        dataset_duty_type = str(dataset_info.get('duty_type') or '').strip().lower()
-        dataset_draw_type = str(dataset_info.get('draw_type') or '').strip().lower()
-        if dataset_duty_type == 'pose' or dataset_draw_type == 'point':
-            db_kpt_labels = parse_json_array_field(dataset_info.get('kpt_labels'))
-            try:
-                db_kpt_num = int(dataset_info.get('kpt_num') or 0)
-            except (TypeError, ValueError):
-                db_kpt_num = 0
-            pose_fields_complete = bool(db_kpt_labels and db_kpt_num == len(db_kpt_labels))
-
-        if (
-            not force_stats
-            and current_hash
-            and previous_hash
-            and current_hash == previous_hash
-            and (not previous_hash_schema or previous_hash_schema == ORIGINAL_DATASET_HASH_SCHEMA_VERSION)
-            and pose_fields_complete
-        ):
-            logger.info(
-                f"original_dataset目录哈希未变,跳过数据集统计: dataset_id={dataset_id}, hash={current_hash}"
-            )
-            return jsonify({
-                "code": 0,
-                "data": {
-                    "message": "原始数据集目录未变更,跳过统计",
-                    "dataset_id": dataset_id,
-                    "skipped": True,
-                    "original_dataset_hash": current_hash,
-                    "original_dataset_hash_schema": ORIGINAL_DATASET_HASH_SCHEMA_VERSION
-                }
-            })
-
-        stats_result = collect_dataset_stats_result(dataset_id)
-
-        # stats 阶段会修改目录(补负样本 json、删除孤立 json),统计完成后重新计算并写库
-        try:
-            new_hash = compute_original_dataset_hash(dataset_id)
-            if new_hash:
-                db_manager.update_dataset_original_hash(
-                    dataset_id,
-                    new_hash,
-                    schema_version=ORIGINAL_DATASET_HASH_SCHEMA_VERSION,
-                )
-                stats_result['original_dataset_hash'] = new_hash
-                stats_result['original_dataset_hash_schema'] = ORIGINAL_DATASET_HASH_SCHEMA_VERSION
-        except Exception as e:
-            logger.warning(f"统计完成后写入original_dataset_hash失败: dataset_id={dataset_id}, error={str(e)}")
+        stats_result = ensure_dataset_stats_current(
+            dataset_id,
+            dataset_info=dataset_info,
+            force_stats=force_stats,
+        )
 
         return jsonify({
             "code": 0,
-            "data": {
-                "message": "数据集统计完成",
-                "skipped": False,
-                **stats_result
-            }
+            "data": stats_result
         })
     except FileNotFoundError as e:
         logger.error(f"数据集统计路径不存在: {str(e)}")
@@ -6138,14 +6474,8 @@ class AutoLabelRedisManager:
     def build_key(self, label_task_id):
         return f"{self.KEY_PREFIX}:{label_task_id}"
 
-    def start_task(self, label_task_id, model_id, conf, classes):
-        """创建进行中 key。存在则说明该标注任务已有自动标注在跑。"""
-        if not self.client:
-            logger.warning("AutoLabelRedisManager未连接，无法创建自动标注状态key")
-            return False, None, "Redis不可用，无法创建自动标注状态key"
-
-        key = self.build_key(label_task_id)
-        value = json.dumps({
+    def _build_lock_value(self, label_task_id, model_id, conf, classes):
+        return json.dumps({
             'label_task_id': str(label_task_id),
             'model_id': str(model_id),
             'conf': str(conf),
@@ -6154,20 +6484,71 @@ class AutoLabelRedisManager:
             'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }, ensure_ascii=False)
 
+    def _try_create_lock(self, key, value):
+        return self.client.set(
+            key,
+            value,
+            nx=True,
+            ex=AUTO_LABEL_REDIS_LOCK_TTL_SECONDS
+        )
+
+    def _parse_lock_value(self, value):
+        if not value:
+            return None
         try:
-            created = self.client.set(
-                key,
-                value,
-                nx=True,
-                ex=AUTO_LABEL_REDIS_LOCK_TTL_SECONDS
-            )
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _is_stale_lock(self, value, ttl):
+        parsed = self._parse_lock_value(value)
+        if parsed is None:
+            return True
+        if parsed.get('status') != 'processing':
+            return True
+        # ttl=-1 表示 key 没有过期时间，容易永久阻塞；ttl=-2 表示查询时已不存在。
+        if ttl in (-1, -2):
+            return True
+        return False
+
+    def start_task(self, label_task_id, model_id, conf, classes):
+        """创建进行中 key。存在则说明该标注任务已有自动标注在跑。"""
+        if not self.client:
+            logger.warning("AutoLabelRedisManager未连接，无法创建自动标注状态key")
+            return False, None, "Redis不可用，无法创建自动标注状态key"
+
+        key = self.build_key(label_task_id)
+        value = self._build_lock_value(label_task_id, model_id, conf, classes)
+
+        try:
+            created = self._try_create_lock(key, value)
             if created:
                 logger.info(f"自动标注状态key创建成功: {key}")
                 return True, key, None
 
             existing_value = self.client.get(key)
-            logger.warning(f"自动标注任务已在进行中: key={key}, value={existing_value}")
-            return False, key, existing_value or "自动标注任务已在进行中"
+            ttl = self.client.ttl(key)
+            if self._is_stale_lock(existing_value, ttl):
+                logger.warning(
+                    f"检测到自动标注残留状态key，准备清理并重试: "
+                    f"key={key}, ttl={ttl}, value={existing_value}"
+                )
+                self.client.delete(key)
+                created = self._try_create_lock(key, value)
+                if created:
+                    logger.info(f"自动标注残留状态key已清理并重新创建成功: {key}")
+                    return True, key, None
+
+                existing_value = self.client.get(key)
+                ttl = self.client.ttl(key)
+
+            logger.warning(f"自动标注任务已在进行中: key={key}, ttl={ttl}, value={existing_value}")
+            return False, key, {
+                "message": "自动标注任务已在进行中",
+                "ttl_seconds": ttl,
+                "value": existing_value,
+            }
         except Exception as e:
             logger.error(f"创建自动标注状态key失败: key={key}, error={str(e)}")
             return False, None, str(e)
@@ -6367,26 +6748,203 @@ def map_label_task_path_to_db(path):
     return path_str
 
 
-def scan_auto_label_image_dir(image_root: Path):
-    image_paths = []
+@dataclass(frozen=True)
+class AutoLabelImageItem:
+    name: str
+    relative_path: str
+    relative_key: str
+    image_path: str
+    json_path: str
+    image_db_path: str
+    json_db_path: str
+    read_path: str
+    write_path: str
+    storage: str
+
+
+_auto_label_smb_registered = False
+_auto_label_smb_lock = threading.Lock()
+
+
+def _normalize_auto_label_rel_path(path) -> str:
+    return normalize_posix_path(path).strip('/')
+
+
+def _build_virtual_auto_label_path(local_root: str, relative_path: str) -> str:
+    local_root = normalize_posix_path(local_root).rstrip('/')
+    relative_path = _normalize_auto_label_rel_path(relative_path)
+    return f"{local_root}/{relative_path}" if relative_path else local_root
+
+
+def _with_json_suffix(path: str) -> str:
+    return str(PurePosixPath(normalize_posix_path(path)).with_suffix('.json'))
+
+
+def _with_json_suffix_for_native_path(path: str) -> str:
+    base, _ = os.path.splitext(str(path))
+    return f"{base}.json"
+
+
+def _smb_unc_join(*parts) -> str:
+    cleaned = []
+    for index, part in enumerate(parts):
+        value = str(part or '').replace('/', '\\')
+        value = value.rstrip('\\') if index == 0 else value.strip('\\')
+        if value:
+            cleaned.append(value)
+    if not cleaned:
+        return ''
+    result = cleaned[0]
+    for part in cleaned[1:]:
+        result = f"{result}\\{part}"
+    return result
+
+
+def _get_auto_label_smbclient():
+    global _auto_label_smb_registered
+    if not AUTO_LABEL_SMB_ENABLED:
+        raise RuntimeError("自动标注 SMB 未启用，请设置 AUTO_LABEL_SMB_ENABLED=true")
+    if not AUTO_LABEL_SMB_HOST:
+        raise RuntimeError("自动标注 SMB 未配置 NAS 地址，请设置 AUTO_LABEL_SMB_HOST 或 NAS_HOST")
+    if not AUTO_LABEL_SMB_SHARE:
+        raise RuntimeError("自动标注 SMB 未配置共享名，请设置 AUTO_LABEL_SMB_SHARE 或 NAS_SHARE")
+    if not AUTO_LABEL_SMB_USER or not AUTO_LABEL_SMB_PASSWORD:
+        logger.error(
+            f"[自动标注] SMB配置缺失: host={AUTO_LABEL_SMB_HOST}, share={AUTO_LABEL_SMB_SHARE}, "
+            f"user_set={bool(AUTO_LABEL_SMB_USER)}, password_set={bool(AUTO_LABEL_SMB_PASSWORD)}"
+        )
+        raise RuntimeError("自动标注 SMB 未配置账号密码，请设置 AUTO_LABEL_SMB_USER/AUTO_LABEL_SMB_PASSWORD")
+
+    try:
+        import smbclient
+    except ImportError as e:
+        raise RuntimeError("自动标注 SMB 依赖缺失，请安装: pip install smbprotocol") from e
+
+    with _auto_label_smb_lock:
+        if not _auto_label_smb_registered:
+            username = AUTO_LABEL_SMB_USER
+            if AUTO_LABEL_SMB_DOMAIN and '\\' not in username:
+                username = f"{AUTO_LABEL_SMB_DOMAIN}\\{username}"
+            smbclient.register_session(
+                AUTO_LABEL_SMB_HOST,
+                username=username,
+                password=AUTO_LABEL_SMB_PASSWORD,
+            )
+            _auto_label_smb_registered = True
+            logger.info(
+                f"[自动标注] SMB 会话已注册: host={AUTO_LABEL_SMB_HOST}, share={AUTO_LABEL_SMB_SHARE}"
+            )
+    return smbclient
+
+
+def _build_auto_label_item(local_root: str, relative_path: str, read_path: str, storage: str) -> AutoLabelImageItem:
+    relative_path = _normalize_auto_label_rel_path(relative_path)
+    relative_key = str(PurePosixPath(relative_path).with_suffix(''))
+    image_path = _build_virtual_auto_label_path(local_root, relative_path)
+    json_path = _with_json_suffix(image_path)
+    write_path = _with_json_suffix_for_native_path(read_path) if storage == 'smb' else json_path
+    return AutoLabelImageItem(
+        name=PurePosixPath(relative_path).name,
+        relative_path=relative_path,
+        relative_key=relative_key,
+        image_path=image_path,
+        json_path=json_path,
+        image_db_path=map_label_task_path_to_db(image_path),
+        json_db_path=map_label_task_path_to_db(json_path),
+        read_path=read_path,
+        write_path=write_path,
+        storage=storage,
+    )
+
+
+def scan_local_auto_label_image_dir(image_root: Path):
+    image_items = []
     existing_json_keys = set()
+    local_root = normalize_posix_path(str(image_root))
 
     for path in image_root.rglob('*'):
         if not path.is_file():
             continue
 
-        relative_key = path.relative_to(image_root).with_suffix('').as_posix()
+        relative_path = path.relative_to(image_root).as_posix()
+        relative_key = str(PurePosixPath(relative_path).with_suffix(''))
         suffix = path.suffix.lower()
         if suffix in DATASET_IMAGE_EXTENSIONS:
-            image_paths.append(path)
+            image_items.append(
+                _build_auto_label_item(local_root, relative_path, str(path), 'local')
+            )
         elif suffix == '.json':
             existing_json_keys.add(relative_key)
 
-    return sorted(image_paths), existing_json_keys
+    return sorted(image_items, key=lambda item: item.relative_path), existing_json_keys
 
 
-def has_matching_labelme_json(img_path: Path, image_root: Path, existing_json_keys) -> bool:
-    return img_path.relative_to(image_root).with_suffix('').as_posix() in existing_json_keys
+def _build_smb_root_for_auto_label(local_task_dir: Path):
+    local_task_path = normalize_posix_path(str(local_task_dir)).rstrip('/')
+    remote_prefix = normalize_posix_path(AUTO_LABEL_SMB_REMOTE_PREFIX).rstrip('/')
+    if not remote_prefix:
+        return None
+    if local_task_path == remote_prefix:
+        relative_root = ''
+    elif local_task_path.startswith(f"{remote_prefix}/"):
+        relative_root = local_task_path[len(remote_prefix):].lstrip('/')
+    else:
+        return None
+
+    share_root = f"\\\\{AUTO_LABEL_SMB_HOST}\\{AUTO_LABEL_SMB_SHARE}"
+    return _smb_unc_join(share_root, relative_root)
+
+
+def scan_smb_auto_label_image_dir(local_task_dir: Path):
+    smbclient = _get_auto_label_smbclient()
+    root_unc = _build_smb_root_for_auto_label(local_task_dir)
+    if not root_unc:
+        raise FileNotFoundError(f"标注任务目录不在 SMB 映射前缀内: {local_task_dir}")
+
+    image_items = []
+    existing_json_keys = set()
+    local_root = normalize_posix_path(str(local_task_dir))
+    stack = [('', root_unc)]
+
+    try:
+        while stack:
+            rel_dir, current_unc = stack.pop()
+            for entry in smbclient.scandir(current_unc):
+                entry_rel = f"{rel_dir}/{entry.name}".strip('/')
+                entry_unc = _smb_unc_join(current_unc, entry.name)
+                if entry.is_dir():
+                    stack.append((entry_rel, entry_unc))
+                    continue
+                if not entry.is_file():
+                    continue
+
+                suffix = PurePosixPath(entry.name).suffix.lower()
+                relative_key = str(PurePosixPath(entry_rel).with_suffix(''))
+                if suffix in DATASET_IMAGE_EXTENSIONS:
+                    image_items.append(
+                        _build_auto_label_item(local_root, entry_rel, entry_unc, 'smb')
+                    )
+                elif suffix == '.json':
+                    existing_json_keys.add(relative_key)
+    except Exception as e:
+        raise FileNotFoundError(f"SMB标注任务目录不可访问: {local_task_dir}, unc={root_unc}, error={e}") from e
+
+    return sorted(image_items, key=lambda item: item.relative_path), existing_json_keys
+
+
+def scan_auto_label_image_dir(image_root: Path):
+    if image_root.exists():
+        if not image_root.is_dir():
+            raise NotADirectoryError(f"标注任务路径不是目录: {image_root}")
+        image_items, existing_json_keys = scan_local_auto_label_image_dir(image_root)
+        return 'local', image_items, existing_json_keys
+
+    image_items, existing_json_keys = scan_smb_auto_label_image_dir(image_root)
+    return 'smb', image_items, existing_json_keys
+
+
+def has_matching_labelme_json(image_item: AutoLabelImageItem, existing_json_keys) -> bool:
+    return image_item.relative_key in existing_json_keys
 
 
 def parse_trained_class_mapping(value):
@@ -6505,6 +7063,29 @@ def read_image_for_auto_label(img_path: Path):
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
+def decode_auto_label_image_bytes(data: bytes):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError(f"自动标注依赖缺失: {e}")
+
+    if not data:
+        return None
+    array = np.frombuffer(data, dtype=np.uint8)
+    if array.size == 0:
+        return None
+    return cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+
+def read_auto_label_image_item(image_item: AutoLabelImageItem):
+    if image_item.storage == 'smb':
+        smbclient = _get_auto_label_smbclient()
+        with smbclient.open_file(image_item.read_path, mode='rb') as f:
+            return decode_auto_label_image_bytes(f.read())
+    return read_image_for_auto_label(Path(image_item.read_path))
+
+
 def get_auto_label_name(model, cls_id, id_to_label):
     if cls_id in id_to_label:
         return id_to_label[cls_id]
@@ -6517,16 +7098,85 @@ def get_auto_label_name(model, cls_id, id_to_label):
     return str(cls_id)
 
 
-def build_auto_labelme_json(img_path: Path, image_width, image_height, shapes):
+def build_auto_labelme_json(image_name: str, image_width, image_height, shapes):
     return {
         "version": "5.0.1",
         "flags": {},
         "shapes": shapes,
-        "imagePath": img_path.name,
+        "imagePath": image_name,
         "imageData": None,
         "imageHeight": image_height,
         "imageWidth": image_width,
     }
+
+
+def write_auto_label_json(image_item: AutoLabelImageItem, labelme_data):
+    json_text = json.dumps(labelme_data, ensure_ascii=False, indent=2)
+    if image_item.storage == 'smb':
+        smbclient = _get_auto_label_smbclient()
+        with smbclient.open_file(image_item.write_path, mode='wb') as f:
+            f.write(json_text.encode('utf-8'))
+        return
+
+    Path(image_item.write_path).write_text(json_text, encoding='utf-8')
+
+
+def chunked_items(items, chunk_size):
+    for index in range(0, len(items), chunk_size):
+        yield items[index:index + chunk_size]
+
+
+def load_auto_label_images(image_items, executor=None):
+    if executor is None:
+        loaded = []
+        for image_item in image_items:
+            try:
+                loaded.append((image_item, read_auto_label_image_item(image_item), None))
+            except Exception as e:
+                loaded.append((image_item, None, e))
+        return loaded
+
+    futures = [
+        executor.submit(read_auto_label_image_item, image_item)
+        for image_item in image_items
+    ]
+    loaded = []
+    for image_item, future in zip(image_items, futures):
+        try:
+            loaded.append((image_item, future.result(), None))
+        except Exception as e:
+            loaded.append((image_item, None, e))
+    return loaded
+
+
+def build_auto_label_shapes_from_results(results, model, id_to_label, target_class_ids, image_width, image_height):
+    shapes = []
+    for result in results:
+        boxes = getattr(result, 'boxes', None)
+        if boxes is None:
+            continue
+        for box in boxes:
+            cls_id = int(box.cls.item())
+            if cls_id not in target_class_ids:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0].tolist()
+            x1 = max(0.0, min(float(x1), float(image_width - 1)))
+            y1 = max(0.0, min(float(y1), float(image_height - 1)))
+            x2 = max(0.0, min(float(x2), float(image_width - 1)))
+            y2 = max(0.0, min(float(y2), float(image_height - 1)))
+            shapes.append({
+                "label": get_auto_label_name(model, cls_id, id_to_label),
+                "points": [
+                    [round(x1, 2), round(y1, 2)],
+                    [round(x2, 2), round(y2, 2)],
+                ],
+                "group_id": None,
+                "description": "",
+                "shape_type": "rectangle",
+                "flags": {},
+            })
+    return shapes
 
 
 def run_auto_label_for_task_dirs(model, task_dirs, conf, target_class_ids, class_mapping):
@@ -6551,6 +7201,8 @@ def run_auto_label_for_task_dirs(model, task_dirs, conf, target_class_ids, class
         dir_result = {
             'task_dir': db_task_dir,
             'local_task_dir': str(local_task_dir),
+            'storage': None,
+            'batch_size': AUTO_LABEL_BATCH_SIZE,
             'total_images': 0,
             'pending_images': 0,
             'generated_count': 0,
@@ -6561,99 +7213,118 @@ def run_auto_label_for_task_dirs(model, task_dirs, conf, target_class_ids, class
         }
         summary['task_dirs'].append(dir_result)
 
-        if not local_task_dir.exists():
-            raise FileNotFoundError(f"标注任务目录不存在: {local_task_dir}")
-        if not local_task_dir.is_dir():
-            raise NotADirectoryError(f"标注任务路径不是目录: {local_task_dir}")
+        storage_mode, image_items, existing_json_keys = scan_auto_label_image_dir(local_task_dir)
+        pending_items = []
+        for image_item in image_items:
+            if has_matching_labelme_json(image_item, existing_json_keys):
+                dir_result['skipped_existing_count'] += 1
+                summary['skipped_existing_count'] += 1
+            else:
+                pending_items.append(image_item)
 
-        image_paths, existing_json_keys = scan_auto_label_image_dir(local_task_dir)
-        pending_count = sum(
-            1 for img_path in image_paths
-            if not has_matching_labelme_json(img_path, local_task_dir, existing_json_keys)
-        )
-        dir_result['total_images'] = len(image_paths)
+        pending_count = len(pending_items)
+        dir_result['storage'] = storage_mode
+        dir_result['total_images'] = len(image_items)
         dir_result['pending_images'] = pending_count
-        summary['total_images'] += len(image_paths)
+        summary['total_images'] += len(image_items)
         summary['pending_images'] += pending_count
 
         logger.info(
             f"[自动标注] 扫描目录完成: task_dir={db_task_dir}, local={local_task_dir}, "
-            f"images={len(image_paths)}, existing_json={len(existing_json_keys)}, pending={pending_count}"
+            f"storage={storage_mode}, images={len(image_items)}, existing_json={len(existing_json_keys)}, "
+            f"pending={pending_count}, batch_size={AUTO_LABEL_BATCH_SIZE}"
         )
 
-        for img_path in image_paths:
-            if has_matching_labelme_json(img_path, local_task_dir, existing_json_keys):
-                dir_result['skipped_existing_count'] += 1
-                summary['skipped_existing_count'] += 1
-                continue
+        executor = None
+        if storage_mode == 'smb' and AUTO_LABEL_SMB_READ_WORKERS > 1:
+            executor = ThreadPoolExecutor(max_workers=AUTO_LABEL_SMB_READ_WORKERS)
 
-            img = read_image_for_auto_label(img_path)
-            if img is None:
-                dir_result['unreadable_count'] += 1
-                summary['unreadable_count'] += 1
-                continue
-
+        def process_prediction_result(image_item, img, image_results):
             image_height, image_width = img.shape[:2]
-            try:
-                results = model(img, conf=conf, verbose=False)
-                shapes = []
-                for result in results:
-                    boxes = getattr(result, 'boxes', None)
-                    if boxes is None:
+            shapes = build_auto_label_shapes_from_results(
+                image_results,
+                model,
+                id_to_label,
+                target_class_ids,
+                image_width,
+                image_height
+            )
+            if not shapes:
+                dir_result['skipped_empty_count'] += 1
+                summary['skipped_empty_count'] += 1
+                return
+
+            labelme_data = build_auto_labelme_json(image_item.name, image_width, image_height, shapes)
+            write_auto_label_json(image_item, labelme_data)
+
+            existing_json_keys.add(image_item.relative_key)
+            record = {
+                'image_name': image_item.name,
+                'image_path': image_item.image_path,
+                'image_db_path': image_item.image_db_path,
+                'json_path': image_item.json_path,
+                'json_db_path': image_item.json_db_path,
+                'shape_count': len(shapes),
+            }
+            summary['generated_records'].append(record)
+            dir_result['generated_count'] += 1
+            summary['generated_count'] += 1
+
+        def mark_image_failed(image_item, error):
+            dir_result['failed_count'] += 1
+            summary['failed_count'] += 1
+            summary['failed_images'].append({'image_path': image_item.image_path, 'error': str(error)})
+            logger.error(f"[自动标注] 图片处理失败: image={image_item.image_path}, error={str(error)}")
+
+        try:
+            for batch_items in chunked_items(pending_items, AUTO_LABEL_BATCH_SIZE):
+                loaded_items = load_auto_label_images(batch_items, executor)
+                valid_items = []
+                for image_item, img, read_error in loaded_items:
+                    if read_error is not None:
+                        dir_result['unreadable_count'] += 1
+                        summary['unreadable_count'] += 1
+                        logger.error(
+                            f"[自动标注] 图片读取失败: image={image_item.image_path}, error={str(read_error)}"
+                        )
                         continue
-                    for box in boxes:
-                        cls_id = int(box.cls.item())
-                        if cls_id not in target_class_ids:
-                            continue
+                    if img is None:
+                        dir_result['unreadable_count'] += 1
+                        summary['unreadable_count'] += 1
+                        continue
+                    valid_items.append((image_item, img))
 
-                        x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0].tolist()
-                        x1 = max(0.0, min(float(x1), float(image_width - 1)))
-                        y1 = max(0.0, min(float(y1), float(image_height - 1)))
-                        x2 = max(0.0, min(float(x2), float(image_width - 1)))
-                        y2 = max(0.0, min(float(y2), float(image_height - 1)))
-                        shapes.append({
-                            "label": get_auto_label_name(model, cls_id, id_to_label),
-                            "points": [
-                                [round(x1, 2), round(y1, 2)],
-                                [round(x2, 2), round(y2, 2)],
-                            ],
-                            "group_id": None,
-                            "description": "",
-                            "shape_type": "rectangle",
-                            "flags": {},
-                        })
-
-                if not shapes:
-                    dir_result['skipped_empty_count'] += 1
-                    summary['skipped_empty_count'] += 1
+                if not valid_items:
                     continue
 
-                json_path = img_path.with_suffix('.json')
-                labelme_data = build_auto_labelme_json(img_path, image_width, image_height, shapes)
-                json_path.write_text(
-                    json.dumps(labelme_data, ensure_ascii=False, indent=2),
-                    encoding='utf-8'
-                )
+                batch_images = [img for _, img in valid_items]
+                try:
+                    batch_results = model(batch_images, conf=conf, verbose=False)
+                    if len(batch_results) != len(valid_items):
+                        raise RuntimeError(
+                            f"批量推理返回数量不匹配: inputs={len(valid_items)}, results={len(batch_results)}"
+                        )
+                except Exception as batch_error:
+                    logger.error(
+                        f"[自动标注] 批量推理失败，回退单图处理: "
+                        f"batch_size={len(valid_items)}, error={str(batch_error)}"
+                    )
+                    for image_item, img in valid_items:
+                        try:
+                            single_results = model(img, conf=conf, verbose=False)
+                            process_prediction_result(image_item, img, single_results)
+                        except Exception as image_error:
+                            mark_image_failed(image_item, image_error)
+                    continue
 
-                existing_json_keys.add(img_path.relative_to(local_task_dir).with_suffix('').as_posix())
-                image_db_path = map_label_task_path_to_db(str(img_path))
-                json_db_path = map_label_task_path_to_db(str(json_path))
-                record = {
-                    'image_name': img_path.name,
-                    'image_path': str(img_path),
-                    'image_db_path': image_db_path,
-                    'json_path': str(json_path),
-                    'json_db_path': json_db_path,
-                    'shape_count': len(shapes),
-                }
-                summary['generated_records'].append(record)
-                dir_result['generated_count'] += 1
-                summary['generated_count'] += 1
-            except Exception as e:
-                dir_result['failed_count'] += 1
-                summary['failed_count'] += 1
-                summary['failed_images'].append({'image_path': str(img_path), 'error': str(e)})
-                logger.error(f"[自动标注] 图片处理失败: image={img_path}, error={str(e)}")
+                for (image_item, img), image_result in zip(valid_items, batch_results):
+                    try:
+                        process_prediction_result(image_item, img, [image_result])
+                    except Exception as image_error:
+                        mark_image_failed(image_item, image_error)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     return summary
 
@@ -6756,6 +7427,10 @@ def auto_label_dataset():
                 class_mapping
             )
         except ValueError as e:
+            logger.warning(
+                f"[自动标注] 类别参数错误: label_task_id={label_task_id}, model_id={model_id}, "
+                f"classes={data.get('classes')}, class_mapping={class_mapping}, error={str(e)}"
+            )
             return jsonify({"code": 1, "data": {"message": str(e)}}), 400
 
         result = run_auto_label_for_task_dirs(
@@ -6891,7 +7566,7 @@ def predict_with_model():
                 
                 try:
                     with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                        sql = "SELECT bestmodel_address FROM trained_weights WHERE id = %s"
+                        sql = "SELECT bestmodel_address, duty_type FROM trained_weights WHERE id = %s"
                         cursor.execute(sql, (model_id,))
                         result = cursor.fetchone()
                         
@@ -6903,7 +7578,9 @@ def predict_with_model():
                             return
                         
                         model_storage_address = result['bestmodel_address']
-                        logger.info(f"[异步推理] 模型存储地址: {model_storage_address}")
+                        duty_type = str(result.get('duty_type') or '').strip().lower()
+                        yolo_task = duty_type if duty_type in {'detect', 'segment', 'pose'} else None
+                        logger.info(f"[异步推理] 模型存储地址: {model_storage_address}, duty_type={duty_type or 'auto'}")
                 finally:
                     connection.close()
                 
@@ -6940,6 +7617,7 @@ def predict_with_model():
                 logger.info(f"[异步推理] 加载模型并开始推理，置信度: {confidence}")
 
                 model = YOLO(local_model_path)
+                predict_task_args = {'task': yolo_task} if yolo_task else {}
 
                 image_files = []
                 video_files = []
@@ -6981,7 +7659,8 @@ def predict_with_model():
                             save=True,
                             project=str(local_results_path.parent),
                             name=local_results_path.name,
-                            exist_ok=True
+                            exist_ok=True,
+                            **predict_task_args
                         )
                         logger.info(f"[异步推理] 图片批量推理完成，处理了 {len(results)} 张图片")
 
@@ -7000,7 +7679,8 @@ def predict_with_model():
                                         result = model.predict(
                                             source=str(img_path),
                                             conf=confidence,
-                                            save=False
+                                            save=False,
+                                            **predict_task_args
                                         )
                                         if result and len(result) > 0:
                                             result_img = result[0].plot()
@@ -7026,7 +7706,8 @@ def predict_with_model():
                                 result = model.predict(
                                     source=str(img_path),
                                     conf=confidence,
-                                    save=False
+                                    save=False,
+                                    **predict_task_args
                                 )
                                 if result and len(result) > 0:
                                     result_img = result[0].plot()
@@ -7120,7 +7801,14 @@ def predict_with_model():
                                 continue
 
                         frame_idx = 0
-                        for result in model.predict(source=str(video_path), conf=confidence, stream=True, save=False, verbose=False):
+                        for result in model.predict(
+                            source=str(video_path),
+                            conf=confidence,
+                            stream=True,
+                            save=False,
+                            verbose=False,
+                            **predict_task_args
+                        ):
                             annotated = result.plot()
                             if annotated.shape[1] != target_w or annotated.shape[0] != target_h:
                                 annotated = cv2.resize(annotated, (target_w, target_h))
